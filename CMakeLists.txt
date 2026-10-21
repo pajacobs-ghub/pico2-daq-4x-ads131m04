@@ -27,7 +27,6 @@ target_sources(pico2_daq_4x_ads131m04 PRIVATE pico2_daq.c)
 # pull in common dependencies
 target_link_libraries(pico2_daq_4x_ads131m04 PRIVATE
 	pico_stdlib
-    pico_multicore
     pico_util
 	hardware_timer
 	hardware_spi
