@@ -6,6 +6,9 @@
 // PJ 2026-10-19: Adapted from the code for Jeremy's small-board prototype
 //    that was built with a single ADS131M04 converter providing 4 channels,
 //    plus bits of code from the 8xMPC3301 board.
+//    2026-10-22: Change the blocking call to drive the SPI0 module with
+//    an arrangement that uses DMA channels to send data to and
+//    collect data from the SPI0 module.
 
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
@@ -22,7 +25,7 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.2 Pico2 as DAQ-MCU 2026-10-21"
+#define VERSION_STR "v0.3 Pico2 as DAQ-MCU 2026-10-22"
 const uint n_adc_chips = 4;
 
 // Names for the GPIO pins.
@@ -257,12 +260,46 @@ static inline void prepare_to_write_adc_clock_register(uint8_t OSR_bits, uint8_t
     prepare_to_write_adc_register(0x03, clock_reg);
 }
 
-static inline void exchange_full_frame_adc0()
+static uint dma_spi0_tx, dma_spi0_rx;
+static dma_channel_config tx_cfg, rx_cfg;
+
+static inline int exchange_full_frame_adc0(uint32_t timeout_period_us)
+// Returns 0 on a successful transfer, 1 on time-out.
 {
     gpio_put(CS_0_PIN, 0); // Select the ADS131M04-0 chip.
     busy_wait_us(1);
-    spi_write_read_blocking(spi0, outgoing_bytes_adc, incoming_bytes_adc, N_BYTES_IN_FRAME);
-    gpio_put(CS_0_PIN, 1); // Deselect.
+    // spi_write_read_blocking(spi0, outgoing_bytes_adc, incoming_bytes_adc, N_BYTES_IN_FRAME);
+    //
+    // 2026-10-22 PJ For the moment, get the DMA module to do the data transfers
+    // but keep all of the code here so that it is just a simple replacement for the
+    // original blocking call above.  Eventually, we will make better use of all of
+    // this machinery by starting off exchanges with all 4 ADS131M04 chips letting
+    // them independently complete.
+    uint64_t timeout = time_us_64() + timeout_period_us;
+    dma_channel_configure(dma_spi0_tx, &tx_cfg,
+                          &spi_get_hw(spi0)->dr, // write address
+                          outgoing_bytes_adc, // read address
+                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
+                          false); // start later...
+    dma_channel_configure(dma_spi0_rx, &rx_cfg,
+                          incoming_bytes_adc, // write address
+                          &spi_get_hw(spi0)->dr, // read address
+                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
+                          false); // start later...
+    // At this point, the outgoing data bytes are in place and ready to be sent via SPI0.
+    dma_start_channel_mask((1u << dma_spi0_tx) | (1u << dma_spi0_rx));
+    //
+    // Wait for the data to be clocked out.
+    while (dma_channel_is_busy(dma_spi0_tx) ||
+           dma_channel_is_busy(dma_spi0_rx)) {
+        if (time_reached(timeout)) {
+            gpio_put(CS_0_PIN, 1); // Deselect the ADS131M04-0 chip.
+            return 1;
+        }
+    }
+    // Normal completion, within time-out period.
+    gpio_put(CS_0_PIN, 1); // Deselect the ADS131M04-0 chip.
+    return 0;
 }
 
 static inline void unpack_adc_sample_data()
@@ -332,13 +369,16 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // Set the OSR and PWR in the CLOCK register before the first SYNC.
     prepare_to_write_adc_clock_register(OSR_bits, PWR_bits);
     // We actually set the register by exchanging a full frame.
-    exchange_full_frame_adc0();
+    // With the SPI clock running at 8MHz, we expect 1 byte transferred per microsecond.
+    // Set a reasonable time-out period to give sufficient time for 18 bytes to be exchanged.
+    // FIX-ME PJ 2026-10-22 We should check the return value from this call.
+    exchange_full_frame_adc0(100);
     // Read the response.
     prepare_adc_command(0); // NULL command
     uint64_t timeout = time_us_64() + 10000; // 10ms timeout
     if (wait_for_data_ready_adc0(timeout)) return 4;
     busy_wait_us(1);
-    exchange_full_frame_adc0();
+    exchange_full_frame_adc0(100);
     // At this point, we have the response to the register-write command
     // sitting in the incoming buffer.
     // FIX-ME PJ 2026-10-21 we should check that the register was written.
@@ -357,7 +397,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         timeout = time_us_64() + sample_period_us + 1000;
         if (wait_for_data_ready_adc0(timeout)) return (1 + i);
         busy_wait_us(1);
-        exchange_full_frame_adc0();
+        exchange_full_frame_adc0(100);
     }
     //
     while (samples_remaining > 0) {
@@ -368,7 +408,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         timeout = time_us_64() + sample_period_us + 1000;
         if (wait_for_data_ready_adc0(timeout)) return 9;
         busy_wait_us(1);
-        exchange_full_frame_adc0();
+        exchange_full_frame_adc0(100);
         unpack_adc_sample_data();
         for (uint ch=0; ch < N_CHAN; ++ch) {
             data[next_fullword_index_in_data+ch] = sample_data[ch];
@@ -780,6 +820,21 @@ int main()
     //
     gpio_init(DRDY_0_PIN);
     gpio_set_dir(DRDY_0_PIN, GPIO_IN);
+    //
+    // Transfer bytes to and from the SPI0 peripheral via DMA channels.
+    dma_spi0_tx = dma_claim_unused_channel(true);
+    dma_spi0_rx = dma_claim_unused_channel(true);
+    tx_cfg = dma_channel_get_default_config(dma_spi0_tx);
+    rx_cfg = dma_channel_get_default_config(dma_spi0_rx);
+    channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&tx_cfg, true);
+    channel_config_set_write_increment(&tx_cfg, false);
+    channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&rx_cfg, false);
+    channel_config_set_write_increment(&rx_cfg, true);
+    // The dma-transfer requests are paced by the SPI peripheral.
+    channel_config_set_dreq(&tx_cfg, spi_get_dreq(spi0, true)); // tx
+    channel_config_set_dreq(&rx_cfg, spi_get_dreq(spi0, false)); // rx
 	//
 	// Configure pins to drive the ADS131M04-1 chip with SPI1.
 	//
@@ -842,5 +897,11 @@ int main()
 			printf("fail: empty command\n");
 		}
     }
+    //
+    spi_deinit(spi0);
+    dma_channel_cleanup(dma_spi0_tx);
+    dma_channel_cleanup(dma_spi0_rx);
+    dma_channel_unclaim(dma_spi0_tx);
+    dma_channel_unclaim(dma_spi0_rx);
     return 0;
 }
