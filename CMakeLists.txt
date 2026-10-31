@@ -22,6 +22,8 @@ add_compile_options(-Wall
 
 add_executable(pico2_daq_4x_ads131m04)
 
+pico_generate_pio_header(pico2_daq_4x_ads131m04 ${CMAKE_CURRENT_LIST_DIR}/spi.pio)
+
 target_sources(pico2_daq_4x_ads131m04 PRIVATE pico2_daq.c)
 
 # pull in common dependencies
@@ -32,6 +34,7 @@ target_link_libraries(pico2_daq_4x_ads131m04 PRIVATE
 	hardware_spi
     hardware_pwm
     hardware_dma
+    hardware_pio
 	)
 
 # enable uart0

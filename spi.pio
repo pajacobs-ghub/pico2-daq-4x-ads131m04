@@ -1,0 +1,55 @@
+; spi.pio
+; Cut-down copy of the full-duplex SPI example from section 11.6.1 of the RP2350 Data Sheet
+;
+; - Only CPOL=0 CPHA=1 is implemented, as this suits the ADS131M04 converter chip.
+;   Data transitions on SCK going high (leading edge of clock pulse).
+;   Data read on SCK going low (trailing edge of pulse).
+; - Pin assignments:
+;   - SCK is side-set pin 0
+;   - MOSI is OUT pin 0
+;   - MISO is IN pin 0
+; - Autopush and autopull are used and the frame-size is set via the threshold.
+; - Frame size is 8 bits, for single byte exchanges.
+; - We assume that the FIFO register interactions happen via 8-bit writes and reads.
+;   This takes advantage of the narrow store byte replication and narrow read byte selection
+;   behaviour of the RP2350 bus fabric.  See section 2.1.5 of the data sheet.
+;
+; Peter J. 2026-11-01
+
+.program spi_cpha1
+.side_set 1
+
+.wrap_target
+    out x, 1    side 0     ; Stall here on empty, keeping SCK low.
+    mov pins, x side 1 [1] ; Output data, SCK goes high (mov pins uses OUT mapping)
+    in pins, 1  side 0     ; Input data, SCK goes low
+.wrap
+
+% c-sdk {
+#include "hardware/gpio.h"
+static inline void pio_spi_init(PIO pio, uint sm, uint prog_offs,
+                                uint pin_sck, uint pin_mosi, uint pin_miso) {
+    pio_sm_config c = spi_cpha1_program_get_default_config(prog_offs);
+    sm_config_set_out_pins(&c, pin_mosi, 1);
+    sm_config_set_in_pins(&c, pin_miso);
+    sm_config_set_sideset_pins(&c, pin_sck);
+    // MSB-first (shift to left, auto push/pull, threshold=8 bits)
+    sm_config_set_out_shift(&c, false, true, 8);
+    sm_config_set_in_shift(&c, false, true, 8);
+    sm_config_set_clkdiv(&c, 4.6875f);  // to get 8 MHz SCK, clkdiv = 150/4/8 = 4.6875
+
+    // MOSI, SCK output are low, MISO is input
+    pio_sm_set_pins_with_mask64(pio, sm, 0, (1ull << pin_sck) | (1ull << pin_mosi));
+    pio_sm_set_pindirs_with_mask64(pio, sm, (1ull << pin_sck) | (1ull << pin_mosi),
+                                   (1ull << pin_sck) | (1ull << pin_mosi) | (1ull << pin_miso));
+    pio_gpio_init(pio, pin_mosi);
+    pio_gpio_init(pio, pin_miso);
+    pio_gpio_init(pio, pin_sck);
+
+    // SPI is synchronous, so bypass input synchroniser to reduce input delay.
+    pio_set_input_sync_bypass_with_mask64(pio, 1ull << pin_miso, 1ull << pin_miso);
+
+    pio_sm_init(pio, sm, prog_offs, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

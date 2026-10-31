@@ -9,6 +9,7 @@
 //    2026-10-22: Change the blocking call to drive the SPI0 module with
 //    an arrangement that uses DMA channels to send data to and
 //    collect data from the SPI0 module.
+//    2026-11-01: Add SPI-2 and SPI-3 implementations via PIO.
 
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
@@ -24,8 +25,10 @@
 #include <stdlib.h>
 #include <math.h>
 #include <ctype.h>
+#include "spi.pio.h"
+#include "hardware/structs/pio.h"
 
-#define VERSION_STR "v0.4 Pico2 as DAQ-MCU 2026-10-23"
+#define VERSION_STR "v0.5 Pico2 as DAQ-MCU 2026-11-01"
 const uint n_adc_chips = 4;
 
 // Names for the GPIO pins.
@@ -170,7 +173,7 @@ void set_registers_to_original_values()
     // and the resultant data output rates.
     // With LOW-POWER mode, f_CLKIN=4.096 MHz, f_MOD=2.048 MHz, OSR=512
     // f_DATA = f_MOD / OSR = 4 kSps
-    vregister[NCHANNELS] = 8; // number of active analog channels
+    vregister[NCHANNELS] = 16; // number of active analog channels
     // FIX-ME PJ 2026-10-21 Since we are porting this code over from the prototype board
     // that had only one ADS131M04 ADC chip, there are a few places that 4 channels and
     // a single ADC chip has been assumed.
@@ -264,13 +267,17 @@ static inline void prepare_to_write_adc_clock_register(uint8_t OSR_bits, uint8_t
 }
 
 static uint dma_spi0_tx, dma_spi0_rx, dma_spi1_tx, dma_spi1_rx;
+static uint dma_spi2_tx, dma_spi2_rx, dma_spi3_tx, dma_spi3_rx;
 static dma_channel_config tx0_cfg, rx0_cfg, tx1_cfg, rx1_cfg;
+static dma_channel_config tx2_cfg, rx2_cfg, tx3_cfg, rx3_cfg;
 
 static inline int exchange_full_frame_adc01(uint32_t timeout_period_us)
 // Returns 0 on a successful transfer, 1 on time-out.
 {
     gpio_put(CS_0_PIN, 0); // Select the ADS131M04-0 chip.
     gpio_put(CS_1_PIN, 0); // Select the ADS131M04-1 chip.
+    gpio_put(CS_2_PIN, 0); // Select the ADS131M04-2 chip.
+    gpio_put(CS_3_PIN, 0); // Select the ADS131M04-3 chip.
     busy_wait_us(1);
     // spi_write_read_blocking(spi0, outgoing_bytes_adc, incoming_bytes_adc, N_BYTES_IN_FRAME);
     //
@@ -300,17 +307,43 @@ static inline int exchange_full_frame_adc01(uint32_t timeout_period_us)
                           &spi_get_hw(spi1)->dr, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
+    dma_channel_configure(dma_spi2_tx, &tx2_cfg,
+                          &pio0->txf[0], // write address
+                          outgoing_bytes_adc, // read address
+                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
+                          false); // start later...
+    dma_channel_configure(dma_spi2_rx, &rx2_cfg,
+                          incoming_bytes_adc[1], // write address
+                          &pio0->rxf[0], // read address
+                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
+                          false); // start later...
+    dma_channel_configure(dma_spi3_tx, &tx3_cfg,
+                          &pio0->txf[1], // write address
+                          outgoing_bytes_adc, // read address
+                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
+                          false); // start later...
+    dma_channel_configure(dma_spi3_rx, &rx3_cfg,
+                          incoming_bytes_adc[1], // write address
+                          &pio0->rxf[1], // read address
+                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
+                          false); // start later...
     // At this point, the outgoing data bytes are in place and ready to be sent via SPI0.
     dma_start_channel_mask((1u << dma_spi0_tx) | (1u << dma_spi0_rx) |
-                           (1u << dma_spi1_tx) | (1u << dma_spi1_rx) );
+                           (1u << dma_spi1_tx) | (1u << dma_spi1_rx) |
+                           (1u << dma_spi2_tx) | (1u << dma_spi2_rx) |
+                           (1u << dma_spi3_tx) | (1u << dma_spi3_rx));
     //
     // Wait for the data to be clocked out.
     while (dma_channel_is_busy(dma_spi0_tx) || dma_channel_is_busy(dma_spi0_rx) ||
-           dma_channel_is_busy(dma_spi1_tx) || dma_channel_is_busy(dma_spi1_rx) ) {
+           dma_channel_is_busy(dma_spi1_tx) || dma_channel_is_busy(dma_spi1_rx) ||
+           dma_channel_is_busy(dma_spi2_tx) || dma_channel_is_busy(dma_spi2_rx) ||
+           dma_channel_is_busy(dma_spi3_tx) || dma_channel_is_busy(dma_spi3_rx)) {
         if (time_reached(timeout)) {
             // Deselect the ADS131M04-x chips and get out, signalling time-out.
             gpio_put(CS_0_PIN, 1);
             gpio_put(CS_1_PIN, 1);
+            gpio_put(CS_2_PIN, 1);
+            gpio_put(CS_3_PIN, 1);
             return 1;
         }
     }
@@ -318,6 +351,8 @@ static inline int exchange_full_frame_adc01(uint32_t timeout_period_us)
     // Deselect the ADS131M04-x chips before leaving.
     gpio_put(CS_0_PIN, 1);
     gpio_put(CS_1_PIN, 1);
+    gpio_put(CS_2_PIN, 1);
+    gpio_put(CS_3_PIN, 1);
     return 0;
 }
 
@@ -794,21 +829,25 @@ int main()
     bi_decl(bi_1pin_with_name(EVENT_PIN, "EVENT input/output pin"));
     bi_decl(bi_1pin_with_name(SYNC_PIN, "ADS131M04-x SYNC, ouput pin"));
     bi_decl(bi_1pin_with_name(MCLK_PIN, "ADS131M04-x CLKIN, PWM ouput pin"));
+    // SPI0 <-> ADC-0
     bi_decl(bi_1pin_with_name(CS_0_PIN, "ADS131M04-0 chip select, output pin"));
-    bi_decl(bi_3pins_with_func(MISO_0_PIN, MOSI_0_PIN, SCK_0_PIN, GPIO_FUNC_SPI)); // SPI0 <-> ADC-0
+    bi_decl(bi_3pins_with_func(MISO_0_PIN, MOSI_0_PIN, SCK_0_PIN, GPIO_FUNC_SPI));
     bi_decl(bi_1pin_with_name(DRDY_0_PIN, "ADS131M04-0 DRDY, input pin"));
+    // SPI1 <-> ADC-1
     bi_decl(bi_1pin_with_name(CS_1_PIN, "ADS131M04-1 chip select, output pin"));
-    bi_decl(bi_3pins_with_func(MISO_1_PIN, MOSI_1_PIN, SCK_1_PIN, GPIO_FUNC_SPI)); // SPI1 <-> ADC-1
+    bi_decl(bi_3pins_with_func(MISO_1_PIN, MOSI_1_PIN, SCK_1_PIN, GPIO_FUNC_SPI));
     bi_decl(bi_1pin_with_name(DRDY_1_PIN, "ADS131M04-1 DRDY, input pin"));
-    bi_decl(bi_1pin_with_name(CS_2_PIN, "ADS131M04-2 chip select, output pin"));
-    bi_decl(bi_1pin_with_name(MISO_2_PIN, "ADS131M04-2 MISO, input pin")); // PIO0 <-> ADC-2
-    bi_decl(bi_1pin_with_name(SCK_2_PIN, "ADS131M04-2 SCK, output pin"));
-    bi_decl(bi_1pin_with_name(MOSI_2_PIN, "ADS131M04-2 MOSI, input pin"));
+    // PIO-SPI-2 <-> ADC-2
+    bi_decl(bi_4pins_with_names(CS_2_PIN, "ADS131M04-2 chip select, output pin",
+                                MISO_2_PIN, "ADS131M04-2 MISO, input pin",
+                                SCK_2_PIN, "ADS131M04-2 SCK, output pin",
+                                MOSI_2_PIN, "ADS131M04-2 MOSI, input pin"));
     bi_decl(bi_1pin_with_name(DRDY_2_PIN, "ADS131M04-2 DRDY, input pin"));
-    bi_decl(bi_1pin_with_name(CS_3_PIN, "ADS131M04-3 chip select, output pin"));
-    bi_decl(bi_1pin_with_name(MISO_3_PIN, "ADS131M04-3 MISO, input pin")); // PIO1 <-> ADC-3
-    bi_decl(bi_1pin_with_name(SCK_3_PIN, "ADS131M04-3 SCK, output pin"));
-    bi_decl(bi_1pin_with_name(MOSI_3_PIN, "ADS131M04-3 MOSI, input pin"));
+    // PIO-SPI-3 <-> ADC-3
+    bi_decl(bi_4pins_with_names(CS_3_PIN, "ADS131M04-3 chip select, output pin",
+                                MISO_3_PIN, "ADS131M04-3 MISO, input pin",
+                                SCK_3_PIN, "ADS131M04-3 SCK, output pin",
+                                MOSI_3_PIN, "ADS131M04-3 MOSI, input pin"));
     bi_decl(bi_1pin_with_name(DRDY_3_PIN, "ADS131M04-3 DRDY, input pin"));
 	//
 	// Flash LED twice at start up.
@@ -825,7 +864,6 @@ int main()
     gpio_init(CS_0_PIN);
     gpio_set_dir(CS_0_PIN, GPIO_OUT);
     gpio_set_slew_rate(CS_0_PIN, GPIO_SLEW_RATE_FAST);
-    gpio_set_drive_strength(CS_0_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_put(CS_0_PIN, 1); // High to deselect.
     // Limit SPI0 clock to 8MHz.
     spi_init(spi0, 8000*1000);
@@ -833,10 +871,8 @@ int main()
     gpio_set_function(MISO_0_PIN, GPIO_FUNC_SPI);
     gpio_set_function(MOSI_0_PIN, GPIO_FUNC_SPI);
     gpio_set_slew_rate(MOSI_0_PIN, GPIO_SLEW_RATE_FAST);
-    gpio_set_drive_strength(MOSI_0_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_set_function(SCK_0_PIN, GPIO_FUNC_SPI);
     gpio_set_slew_rate(SCK_0_PIN, GPIO_SLEW_RATE_FAST);
-    gpio_set_drive_strength(SCK_0_PIN, GPIO_DRIVE_STRENGTH_12MA);
     //
     gpio_init(DRDY_0_PIN);
     gpio_set_dir(DRDY_0_PIN, GPIO_IN);
@@ -861,7 +897,7 @@ int main()
     gpio_init(CS_1_PIN);
     gpio_set_dir(CS_1_PIN, GPIO_OUT);
     gpio_set_slew_rate(CS_1_PIN, GPIO_SLEW_RATE_FAST);
-    gpio_set_drive_strength(CS_1_PIN, GPIO_DRIVE_STRENGTH_12MA);
+    // gpio_set_drive_strength(CS_1_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_put(CS_1_PIN, 1); // High to deselect.
     //
     // Limit SPI1 clock to 8MHz.
@@ -870,15 +906,13 @@ int main()
     gpio_set_function(MISO_1_PIN, GPIO_FUNC_SPI);
     gpio_set_function(MOSI_1_PIN, GPIO_FUNC_SPI);
     gpio_set_slew_rate(MOSI_1_PIN, GPIO_SLEW_RATE_FAST);
-    gpio_set_drive_strength(MOSI_1_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_set_function(SCK_1_PIN, GPIO_FUNC_SPI);
     gpio_set_slew_rate(SCK_1_PIN, GPIO_SLEW_RATE_FAST);
-    gpio_set_drive_strength(SCK_1_PIN, GPIO_DRIVE_STRENGTH_12MA);
     //
     gpio_init(DRDY_1_PIN);
     gpio_set_dir(DRDY_1_PIN, GPIO_IN);
     //
-    // Transfer bytes to and from the SPI0 peripheral via DMA channels.
+    // Transfer bytes to and from the SPI1 peripheral via DMA channels.
     dma_spi1_tx = dma_claim_unused_channel(true);
     dma_spi1_rx = dma_claim_unused_channel(true);
     tx1_cfg = dma_channel_get_default_config(dma_spi1_tx);
@@ -893,15 +927,77 @@ int main()
     channel_config_set_dreq(&tx1_cfg, spi_get_dreq(spi1, true)); // tx
     channel_config_set_dreq(&rx1_cfg, spi_get_dreq(spi1, false)); // rx
     //
+    // We implement spi2 and spi3 with state machines in the PIO 0 module,
+    // using a common program.
+    uint offset = pio_add_program(pio0, &spi_cpha1_program);
+    //
+    // Configure pins to drive the ADS131M04-2 chip via pio0 sm=0 implementing spi2
+    //
+    pio_spi_init(pio0, 0, offset, SCK_2_PIN, MOSI_2_PIN, MISO_2_PIN);
+    gpio_set_function(MISO_2_PIN, GPIO_FUNC_PIO0);
+    gpio_set_function(MOSI_2_PIN, GPIO_FUNC_PIO0);
+    gpio_set_slew_rate(MOSI_2_PIN, GPIO_SLEW_RATE_FAST);
+    gpio_set_function(SCK_2_PIN, GPIO_FUNC_SPI);
+    gpio_set_slew_rate(SCK_2_PIN, GPIO_SLEW_RATE_FAST);
+    //
+    gpio_init(DRDY_2_PIN);
+    gpio_set_dir(DRDY_2_PIN, GPIO_IN);
+    //
+    // Transfer bytes to and from the spi2 peripheral via DMA channels.
+    dma_spi2_tx = dma_claim_unused_channel(true);
+    dma_spi2_rx = dma_claim_unused_channel(true);
+    tx2_cfg = dma_channel_get_default_config(dma_spi2_tx);
+    rx2_cfg = dma_channel_get_default_config(dma_spi2_rx);
+    channel_config_set_transfer_data_size(&tx2_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&tx2_cfg, true);
+    channel_config_set_write_increment(&tx2_cfg, false);
+    channel_config_set_transfer_data_size(&rx2_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&rx2_cfg, false);
+    channel_config_set_write_increment(&rx2_cfg, true);
+    // The dma-transfer requests are paced by the PIO peripheral.
+    channel_config_set_dreq(&tx2_cfg, pio_get_dreq(pio0, 0, true)); // tx
+    channel_config_set_dreq(&rx2_cfg, pio_get_dreq(pio0, 0, false)); // rx
+    //
+    // Configure pins to drive the ADS131M04-3 chip via pio0 sm=1 implementing spi3
+    //
+    pio_spi_init(pio0, 0, offset, SCK_3_PIN, MOSI_3_PIN, MISO_3_PIN);
+    gpio_set_function(MISO_3_PIN, GPIO_FUNC_PIO0);
+    gpio_set_function(MOSI_3_PIN, GPIO_FUNC_PIO0);
+    gpio_set_slew_rate(MOSI_3_PIN, GPIO_SLEW_RATE_FAST);
+    gpio_set_function(SCK_3_PIN, GPIO_FUNC_SPI);
+    gpio_set_slew_rate(SCK_3_PIN, GPIO_SLEW_RATE_FAST);
+    //
+    gpio_init(DRDY_3_PIN);
+    gpio_set_dir(DRDY_3_PIN, GPIO_IN);
+    //
+    // Transfer bytes to and from the spi3 peripheral via DMA channels.
+    dma_spi3_tx = dma_claim_unused_channel(true);
+    dma_spi3_rx = dma_claim_unused_channel(true);
+    tx3_cfg = dma_channel_get_default_config(dma_spi3_tx);
+    rx3_cfg = dma_channel_get_default_config(dma_spi3_rx);
+    channel_config_set_transfer_data_size(&tx3_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&tx3_cfg, true);
+    channel_config_set_write_increment(&tx3_cfg, false);
+    channel_config_set_transfer_data_size(&rx3_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&rx3_cfg, false);
+    channel_config_set_write_increment(&rx3_cfg, true);
+    // The dma-transfer requests are paced by the PIO peripheral.
+    channel_config_set_dreq(&tx3_cfg, pio_get_dreq(pio0, 1, true)); // tx
+    channel_config_set_dreq(&rx3_cfg, pio_get_dreq(pio0, 1, false)); // rx
+    //
+    // Configure SYNC pin for manual interaction.
+    //
     gpio_init(SYNC_PIN);
     gpio_set_dir(SYNC_PIN, GPIO_OUT);
     gpio_set_slew_rate(SYNC_PIN, GPIO_SLEW_RATE_FAST);
+    // We are driving all 4 ADC chips with this signal so increase drive strength.
     gpio_set_drive_strength(SYNC_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_put(SYNC_PIN, 1); // Idle high.
     //
     // We use PWM slice 1A on GPIO2 (MCLK_PIN).
     gpio_set_function(MCLK_PIN, GPIO_FUNC_PWM);
     gpio_set_slew_rate(MCLK_PIN, GPIO_SLEW_RATE_FAST);
+    // We are driving all 4 ADC chips with this signal so increase drive strength.
     gpio_set_drive_strength(MCLK_PIN, GPIO_DRIVE_STRENGTH_12MA);
 	//
 	gpio_init(EVENT_PIN);
