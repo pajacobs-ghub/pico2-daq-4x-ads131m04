@@ -28,7 +28,7 @@
 #include "spi.pio.h"
 #include "hardware/structs/pio.h"
 
-#define VERSION_STR "v0.7 Pico2 as DAQ-MCU 2026-11-02"
+#define VERSION_STR "v0.8 Pico2 as DAQ-MCU 2026-11-02"
 const uint n_adc_chips = 4;
 
 // Names for the GPIO pins.
@@ -94,12 +94,14 @@ static inline void assert_not_ready()
 
 static inline void assert_event()
 {
-	gpio_put(EVENT_PIN, 1);
+	gpio_put(EVENT_PIN, 0);
+    gpio_set_dir(EVENT_PIN, GPIO_OUT);
 }
 
 static inline void release_event()
 {
-	gpio_put(EVENT_PIN, 0);
+	gpio_set_dir(EVENT_PIN, GPIO_IN);
+    gpio_pull_up(EVENT_PIN);
 }
 
 static inline uint8_t read_system_event_pin()
@@ -135,9 +137,11 @@ uint8_t fullword_index_has_wrapped_around;
 // of 24 bits and a full frames of 6 words but we will look at this data as
 // 18 bytes when interacting with the Pico2's SPI modules.
 # define N_BYTES_IN_FRAME 18
-static uint8_t incoming_bytes_adc[4][N_BYTES_IN_FRAME];
-// All 4 ADC chips receive the same messages.
-static uint8_t outgoing_bytes_adc[N_BYTES_IN_FRAME];
+typedef struct { uint8_t bytes[N_BYTES_IN_FRAME]; } BBuffer;
+// All 4 ADC chips receive the same messages but
+// we receive the incoming messages in separate buffers.
+static BBuffer outgoing_frame_adc;
+static BBuffer incoming_frame_adc[4];
 
 static int sampling_error_flag;
 
@@ -189,9 +193,6 @@ void set_registers_to_original_values()
     // With LOW-POWER mode, f_CLKIN=4.096 MHz, f_MOD=2.048 MHz, OSR=512
     // f_DATA = f_MOD / OSR = 4 kSps
     vregister[NCHANNELS] = 16; // number of active analog channels
-    // FIX-ME PJ 2026-10-21 Since we are porting this code over from the prototype board
-    // that had only one ADS131M04 ADC chip, there are a few places that 4 channels and
-    // a single ADC chip has been assumed.
     vregister[NSAMPLES] = 128; // number of samples in record after trigger event
     vregister[TRIG_MODE] = TRIGGER_IMMEDIATE;
     vregister[TRIG_CHAN] = 0; // trigger channel for internal trigger
@@ -248,10 +249,10 @@ static inline int wait_for_data_ready_adc0(uint64_t timeout)
 static inline void prepare_adc_command(uint16_t cmd)
 // Set up outgoing buffer data for a simple command at next full-frame exchange.
 {
-    outgoing_bytes_adc[0] = (uint8_t)((cmd & 0xff00) >> 8);
-    outgoing_bytes_adc[1] = (uint8_t)(cmd & 0x00ff);
+    outgoing_frame_adc.bytes[0] = (uint8_t)((cmd & 0xff00) >> 8);
+    outgoing_frame_adc.bytes[1] = (uint8_t)(cmd & 0x00ff);
     for (uint i = 2; i < N_BYTES_IN_FRAME; ++i) {
-        outgoing_bytes_adc[i] = (uint8_t)0;
+        outgoing_frame_adc.bytes[i] = (uint8_t)0;
     }
 }
 
@@ -264,12 +265,12 @@ static inline void prepare_to_write_adc_register(uint8_t reg_addr, uint16_t reg_
 // For a single register write, n=0.
 {
     uint16_t cmd = 0x6000 | ((reg_addr & 0x3f) << 7); // WREG command with address
-    outgoing_bytes_adc[0] = (uint8_t)((cmd & 0xff00) >> 8);
-    outgoing_bytes_adc[1] = (uint8_t)(cmd & 0x00ff);
-    outgoing_bytes_adc[2] = (uint8_t)((reg_value & 0xff00) >> 8);
-    outgoing_bytes_adc[3] = (uint8_t)(reg_value & 0x00ff);
+    outgoing_frame_adc.bytes[0] = (uint8_t)((cmd & 0xff00) >> 8);
+    outgoing_frame_adc.bytes[1] = (uint8_t)(cmd & 0x00ff);
+    outgoing_frame_adc.bytes[2] = (uint8_t)((reg_value & 0xff00) >> 8);
+    outgoing_frame_adc.bytes[3] = (uint8_t)(reg_value & 0x00ff);
     for (uint i = 4; i < N_BYTES_IN_FRAME; ++i) {
-        outgoing_bytes_adc[i] = (uint8_t)0;
+        outgoing_frame_adc.bytes[i] = (uint8_t)0;
     }
 }
 
@@ -304,41 +305,41 @@ static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
     uint64_t timeout = time_us_64() + timeout_period_us;
     dma_channel_configure(dma_spi0_tx, &tx0_cfg,
                           (io_rw_8*)&spi_get_hw(spi0)->dr, // write address
-                          outgoing_bytes_adc, // read address
+                          outgoing_frame_adc.bytes, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi0_rx, &rx0_cfg,
-                          incoming_bytes_adc[0], // write address
+                          incoming_frame_adc[0].bytes, // write address
                           (io_rw_8*)&spi_get_hw(spi0)->dr, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi1_tx, &tx1_cfg,
                           (io_rw_8*)&spi_get_hw(spi1)->dr, // write address
-                          outgoing_bytes_adc, // read address
+                          outgoing_frame_adc.bytes, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi1_rx, &rx1_cfg,
-                          incoming_bytes_adc[1], // write address
+                          incoming_frame_adc[1].bytes, // write address
                           (io_rw_8*)&spi_get_hw(spi1)->dr, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi2_tx, &tx2_cfg,
                           (io_rw_8*)&(pio0->txf[0]), // write address
-                          outgoing_bytes_adc, // read address
+                          outgoing_frame_adc.bytes, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi2_rx, &rx2_cfg,
-                          incoming_bytes_adc[2], // write address
+                          incoming_frame_adc[2].bytes, // write address
                           (io_rw_8*)&(pio0->rxf[0]), // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi3_tx, &tx3_cfg,
                           (io_rw_8*)&(pio1->txf[0]), // write address
-                          outgoing_bytes_adc, // read address
+                          outgoing_frame_adc.bytes, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi3_rx, &rx3_cfg,
-                          incoming_bytes_adc[3], // write address
+                          incoming_frame_adc[3].bytes, // write address
                           (io_rw_8*)&(pio1->rxf[0]), // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
@@ -377,9 +378,9 @@ static inline void unpack_adc_sample_data()
         for (int ch=0; ch < 4; ++ch) {
             int32_t word = 0L;
             uint ib = (1+ch)*3; // index of the high-byte for channel ch.
-            word |= (uint32_t)incoming_bytes_adc[iadc][ib] << 16;
-            word |= (uint32_t)incoming_bytes_adc[iadc][ib+1] << 8;
-            word |= (uint32_t)incoming_bytes_adc[iadc][ib+2];
+            word |= (uint32_t)incoming_frame_adc[iadc].bytes[ib] << 16;
+            word |= (uint32_t)incoming_frame_adc[iadc].bytes[ib+1] << 8;
+            word |= (uint32_t)incoming_frame_adc[iadc].bytes[ib+2];
             // Sign-extend to the full 32-bit word.
             if (word & (1L << 23)) word |= 0xFF000000L;
             sample_data[iadc*4+ch] = word;
@@ -941,8 +942,7 @@ int main()
     channel_config_set_dreq(&tx1_cfg, spi_get_dreq(spi1, true)); // tx
     channel_config_set_dreq(&rx1_cfg, spi_get_dreq(spi1, false)); // rx
     //
-    // We implement spi2 and spi3 with state machines in the PIO 0 and 1 modules,
-    // with both state machines using a common program.
+    // We implement spi2 and spi3 with state machines in the PIO 0 and 1 modules.
     uint offset0 = pio_add_program(pio0, &spi_cpol0_cpha1_program);
     uint offset1 = pio_add_program(pio1, &spi_cpol0_cpha1_program);
     //
@@ -1016,8 +1016,6 @@ int main()
     gpio_set_drive_strength(MCLK_PIN, GPIO_DRIVE_STRENGTH_12MA);
 	//
 	gpio_init(EVENT_PIN);
-	gpio_set_dir(EVENT_PIN, GPIO_IN);
-    gpio_disable_pulls(EVENT_PIN);
 	release_event();
 	//
 	// Signal to the COMMS MCU that we are ready.
