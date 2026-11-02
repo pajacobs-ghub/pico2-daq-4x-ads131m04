@@ -20,9 +20,9 @@
 .program spi_cpol0_cpha1
 .pio_version RP2350
 ; sysclk at 150MHz (6.6667ns period)
-; Want the PIO instruction cycle to be 31.25ns so that 4xPIO cycles is 125ns
-; for an 8 MHz SPI clock frequency.
-.clock_div 4.6875
+; Want the PIO instruction cycle to be 62.5ns so that 4xPIO cycles is 250ns
+; for a 4 MHz SPI clock frequency.
+.clock_div 9.375
 .fifo txrx
 .side_set 1
 .in 1 left auto 8
@@ -51,12 +51,12 @@ static inline void pio_spi_init(PIO pio, uint sm, uint prog_offs,
     gpio_set_slew_rate(pin_sck, GPIO_SLEW_RATE_FAST);
 
     // MOSI, SCK output are low, MISO is input
-    pio_sm_set_pins_with_mask64(pio, sm, 0, (1ull << pin_sck) | (1ull << pin_mosi));
-    pio_sm_set_pindirs_with_mask64(pio, sm, (1ull << pin_sck) | (1ull << pin_mosi),
-                                   (1ull << pin_sck) | (1ull << pin_mosi) | (1ull << pin_miso));
+    pio_sm_set_pins_with_mask(pio, sm, 0, (1u << pin_sck) | (1u << pin_mosi));
+    pio_sm_set_pindirs_with_mask(pio, sm, (1u << pin_sck) | (1u << pin_mosi),
+                                   (1u << pin_sck) | (1u << pin_mosi) | (1u << pin_miso));
 
     // SPI is synchronous, so bypass input synchroniser to reduce input delay.
-    pio_set_input_sync_bypass_with_mask64(pio, 1ull << pin_miso, 1ull << pin_miso);
+    pio_set_input_sync_bypass_with_mask(pio, 1u << pin_miso, 1u << pin_miso);
 
     pio_sm_init(pio, sm, prog_offs, &c);
     pio_sm_set_enabled(pio, sm, true);

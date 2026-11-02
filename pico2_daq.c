@@ -28,7 +28,7 @@
 #include "spi.pio.h"
 #include "hardware/structs/pio.h"
 
-#define VERSION_STR "v0.6 Pico2 as DAQ-MCU 2026-11-01"
+#define VERSION_STR "v0.7 Pico2 as DAQ-MCU 2026-11-02"
 const uint n_adc_chips = 4;
 
 // Names for the GPIO pins.
@@ -41,31 +41,46 @@ const uint EVENT_PIN = 22;
 const uint MCLK_PIN = 2;
 const uint SYNC_PIN = 3;
 // C. For SPI0 interaction with ADS1131M04-0 ADC chip.
+#undef SWAP03
+#ifndef SWAP03
 const uint MISO_0_PIN = 4;
 const uint CS_0_PIN = 5;
 const uint SCK_0_PIN = 6;
 const uint MOSI_0_PIN = 7;
+const uint DRDY_0_PIN = 28;
+#else
+const uint MISO_0_PIN = 16;
+const uint CS_0_PIN = 17;
+const uint SCK_0_PIN = 18;
+const uint MOSI_0_PIN = 19;
+const uint DRDY_0_PIN = 21;
+#endif
 // D. For SPI1 interaction with ADS1131M04-1 ADC chip.
 const uint MISO_1_PIN = 8;
 const uint CS_1_PIN = 9;
 const uint SCK_1_PIN = 10;
 const uint MOSI_1_PIN = 11;
-// E. For SPI1/PIOx interaction with ADS1131M04-1 ADC chip.
+const uint DRDY_1_PIN = 27;
+// E. For SPI1/PIOx interaction with ADS1131M04-2 ADC chip.
 const uint MISO_2_PIN = 12;
 const uint CS_2_PIN = 13;
 const uint SCK_2_PIN = 14;
 const uint MOSI_2_PIN = 15;
-// F. For SPI0/PIOx interaction with ADS1131M04-1 ADC chip.
+const uint DRDY_2_PIN = 26;
+// F. For SPI0/PIOx interaction with ADS1131M04-3 ADC chip.
+#ifndef SWAP03
 const uint MISO_3_PIN = 16;
 const uint CS_3_PIN = 17;
 const uint SCK_3_PIN = 18;
 const uint MOSI_3_PIN = 19;
-// G. For data-ready inputs from all ADC chips.
-const uint DRDY_0_PIN = 28;
-const uint DRDY_1_PIN = 27;
-const uint DRDY_2_PIN = 26;
 const uint DRDY_3_PIN = 21;
-
+#else
+const uint MISO_3_PIN = 4;
+const uint CS_3_PIN = 5;
+const uint SCK_3_PIN = 6;
+const uint MOSI_3_PIN = 7;
+const uint DRDY_3_PIN = 28;
+#endif
 
 static inline void assert_ready()
 {
@@ -318,13 +333,13 @@ static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi3_tx, &tx3_cfg,
-                          (io_rw_8*)&(pio0->txf[1]), // write address
+                          (io_rw_8*)&(pio1->txf[0]), // write address
                           outgoing_bytes_adc, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     dma_channel_configure(dma_spi3_rx, &rx3_cfg,
                           incoming_bytes_adc[3], // write address
-                          (io_rw_8*)&(pio0->rxf[1]), // read address
+                          (io_rw_8*)&(pio1->rxf[0]), // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
     // At this point, the outgoing data bytes are in place and ready to be sent via SPI0.
@@ -865,8 +880,8 @@ int main()
     gpio_set_dir(CS_0_PIN, GPIO_OUT);
     gpio_set_slew_rate(CS_0_PIN, GPIO_SLEW_RATE_FAST);
     gpio_put(CS_0_PIN, 1); // High to deselect.
-    // Limit SPI0 clock to 8MHz.
-    spi_init(spi0, 8000*1000);
+    // Limit SPI0 clock to 4MHz.
+    spi_init(spi0, 4000*1000);
     spi_set_format(spi0, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
     gpio_set_function(MISO_0_PIN, GPIO_FUNC_SPI);
     gpio_set_function(MOSI_0_PIN, GPIO_FUNC_SPI);
@@ -899,8 +914,8 @@ int main()
     gpio_set_slew_rate(CS_1_PIN, GPIO_SLEW_RATE_FAST);
     gpio_put(CS_1_PIN, 1); // High to deselect.
     //
-    // Limit SPI1 clock to 8MHz.
-    spi_init(spi1, 8000*1000);
+    // Limit SPI1 clock to 4MHz.
+    spi_init(spi1, 4000*1000);
     spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
     gpio_set_function(MISO_1_PIN, GPIO_FUNC_SPI);
     gpio_set_function(MOSI_1_PIN, GPIO_FUNC_SPI);
@@ -926,9 +941,10 @@ int main()
     channel_config_set_dreq(&tx1_cfg, spi_get_dreq(spi1, true)); // tx
     channel_config_set_dreq(&rx1_cfg, spi_get_dreq(spi1, false)); // rx
     //
-    // We implement spi2 and spi3 with state machines in the PIO 0 module,
+    // We implement spi2 and spi3 with state machines in the PIO 0 and 1 modules,
     // with both state machines using a common program.
-    uint offset = pio_add_program(pio0, &spi_cpol0_cpha1_program);
+    uint offset0 = pio_add_program(pio0, &spi_cpol0_cpha1_program);
+    uint offset1 = pio_add_program(pio1, &spi_cpol0_cpha1_program);
     //
     // Configure pins to drive the ADS131M04-2 chip via pio0 sm=0 implementing spi2
     //
@@ -937,7 +953,7 @@ int main()
     gpio_set_slew_rate(CS_2_PIN, GPIO_SLEW_RATE_FAST);
     gpio_put(CS_2_PIN, 1); // High to deselect.
     //
-    pio_spi_init(pio0, 0, offset, SCK_2_PIN, MOSI_2_PIN, MISO_2_PIN);
+    pio_spi_init(pio0, 0, offset0, SCK_2_PIN, MOSI_2_PIN, MISO_2_PIN);
     //
     gpio_init(DRDY_2_PIN);
     gpio_set_dir(DRDY_2_PIN, GPIO_IN);
@@ -957,14 +973,14 @@ int main()
     channel_config_set_dreq(&tx2_cfg, pio_get_dreq(pio0, 0, true)); // tx
     channel_config_set_dreq(&rx2_cfg, pio_get_dreq(pio0, 0, false)); // rx
     //
-    // Configure pins to drive the ADS131M04-3 chip via pio0 sm=1 implementing spi3
+    // Configure pins to drive the ADS131M04-3 chip via pio1 sm=0 implementing spi3
     //
     gpio_init(CS_3_PIN);
     gpio_set_dir(CS_3_PIN, GPIO_OUT);
     gpio_set_slew_rate(CS_3_PIN, GPIO_SLEW_RATE_FAST);
     gpio_put(CS_3_PIN, 1); // High to deselect.
     //
-    pio_spi_init(pio0, 1, offset, SCK_3_PIN, MOSI_3_PIN, MISO_3_PIN);
+    pio_spi_init(pio1, 0, offset1, SCK_3_PIN, MOSI_3_PIN, MISO_3_PIN);
     //
     gpio_init(DRDY_3_PIN);
     gpio_set_dir(DRDY_3_PIN, GPIO_IN);
@@ -981,8 +997,8 @@ int main()
     channel_config_set_read_increment(&rx3_cfg, false);
     channel_config_set_write_increment(&rx3_cfg, true);
     // The dma-transfer requests are paced by the PIO peripheral.
-    channel_config_set_dreq(&tx3_cfg, pio_get_dreq(pio0, 1, true)); // tx
-    channel_config_set_dreq(&rx3_cfg, pio_get_dreq(pio0, 1, false)); // rx
+    channel_config_set_dreq(&tx3_cfg, pio_get_dreq(pio1, 0, true)); // tx
+    channel_config_set_dreq(&rx3_cfg, pio_get_dreq(pio1, 0, false)); // rx
     //
     // Configure SYNC pin for manual interaction.
     //
@@ -1029,6 +1045,7 @@ int main()
     }
     //
     spi_deinit(spi0);
+    spi_deinit(spi1);
     //
     dma_channel_cleanup(dma_spi0_tx);
     dma_channel_cleanup(dma_spi0_rx);
