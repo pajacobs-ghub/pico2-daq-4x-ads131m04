@@ -28,59 +28,25 @@
 #include "spi.pio.h"
 #include "hardware/structs/pio.h"
 
-#define VERSION_STR "v0.8 Pico2 as DAQ-MCU 2026-11-02"
-const uint n_adc_chips = 4;
+#include "pin_names.h"
 
-// Names for the GPIO pins.
-// A. For interaction with the PIC18F26Q71 COMMS-4-MCU.
-// UART0_TX on GP0 (default)
-// UART0_RX in GP1 (default)
-const uint READY_PIN = 20;
-const uint EVENT_PIN = 22;
-// B. For interaction with all of the ADS131M04 ADC chips.
-const uint MCLK_PIN = 2;
-const uint SYNC_PIN = 3;
-// C. For SPI0 interaction with ADS1131M04-0 ADC chip.
-#undef SWAP03
-#ifndef SWAP03
-const uint MISO_0_PIN = 4;
-const uint CS_0_PIN = 5;
-const uint SCK_0_PIN = 6;
-const uint MOSI_0_PIN = 7;
-const uint DRDY_0_PIN = 28;
+#define VERSION_STR "v0.9 Pico2 as DAQ-MCU 2026-11-03"
+
+// Nominally, we have 4 SPI ports or SPI-like ports,
+// each talking to individual ADC chip.
+//   spi0 is a true SPI port
+//   spi1 is a true SPI port
+//   spi2 is a pio0-implemented SPI port
+//   spi3 is a pio1-implemented SPI port
+#define WITH_PIO_SPI
+#ifdef WITH_PIO_SPI
+// Use all SPI and PIO-SPI ports.
+const uint n_adc_chips = 4;
 #else
-const uint MISO_0_PIN = 16;
-const uint CS_0_PIN = 17;
-const uint SCK_0_PIN = 18;
-const uint MOSI_0_PIN = 19;
-const uint DRDY_0_PIN = 21;
+// Use just the true SPI ports.
+const uint n_adc_chips = 2;
 #endif
-// D. For SPI1 interaction with ADS1131M04-1 ADC chip.
-const uint MISO_1_PIN = 8;
-const uint CS_1_PIN = 9;
-const uint SCK_1_PIN = 10;
-const uint MOSI_1_PIN = 11;
-const uint DRDY_1_PIN = 27;
-// E. For SPI1/PIOx interaction with ADS1131M04-2 ADC chip.
-const uint MISO_2_PIN = 12;
-const uint CS_2_PIN = 13;
-const uint SCK_2_PIN = 14;
-const uint MOSI_2_PIN = 15;
-const uint DRDY_2_PIN = 26;
-// F. For SPI0/PIOx interaction with ADS1131M04-3 ADC chip.
-#ifndef SWAP03
-const uint MISO_3_PIN = 16;
-const uint CS_3_PIN = 17;
-const uint SCK_3_PIN = 18;
-const uint MOSI_3_PIN = 19;
-const uint DRDY_3_PIN = 21;
-#else
-const uint MISO_3_PIN = 4;
-const uint CS_3_PIN = 5;
-const uint SCK_3_PIN = 6;
-const uint MOSI_3_PIN = 7;
-const uint DRDY_3_PIN = 28;
-#endif
+
 
 static inline void assert_ready()
 {
@@ -192,7 +158,7 @@ void set_registers_to_original_values()
     // and the resultant data output rates.
     // With LOW-POWER mode, f_CLKIN=4.096 MHz, f_MOD=2.048 MHz, OSR=512
     // f_DATA = f_MOD / OSR = 4 kSps
-    vregister[NCHANNELS] = 16; // number of active analog channels
+    vregister[NCHANNELS] = (n_adc_chips == 4) ? 16 : 8; // number of active analog channels
     vregister[NSAMPLES] = 128; // number of samples in record after trigger event
     vregister[TRIG_MODE] = TRIGGER_IMMEDIATE;
     vregister[TRIG_CHAN] = 0; // trigger channel for internal trigger
@@ -283,17 +249,22 @@ static inline void prepare_to_write_adc_clock_register(uint8_t OSR_bits, uint8_t
 }
 
 static uint dma_spi0_tx, dma_spi0_rx, dma_spi1_tx, dma_spi1_rx;
-static uint dma_spi2_tx, dma_spi2_rx, dma_spi3_tx, dma_spi3_rx;
 static dma_channel_config tx0_cfg, rx0_cfg, tx1_cfg, rx1_cfg;
+#ifdef WITH_PIO_SPI
+static uint dma_spi2_tx, dma_spi2_rx, dma_spi3_tx, dma_spi3_rx;
 static dma_channel_config tx2_cfg, rx2_cfg, tx3_cfg, rx3_cfg;
+#endif
 
 static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
 // Returns 0 on a successful transfer, 1 on time-out.
 {
-    gpio_put(CS_0_PIN, 0); // Select the ADS131M04-0 chip.
-    gpio_put(CS_1_PIN, 0); // Select the ADS131M04-1 chip.
-    gpio_put(CS_2_PIN, 0); // Select the ADS131M04-2 chip.
-    gpio_put(CS_3_PIN, 0); // Select the ADS131M04-3 chip.
+    // Select the ADS131M04 chips.
+    gpio_put(CS_0_PIN, 0);
+    gpio_put(CS_1_PIN, 0);
+#ifdef WITH_PIO_SPI
+    gpio_put(CS_2_PIN, 0);
+    gpio_put(CS_3_PIN, 0);
+#endif
     busy_wait_us(1);
     // spi_write_read_blocking(spi0, outgoing_bytes_adc, incoming_bytes_adc, N_BYTES_IN_FRAME);
     //
@@ -323,6 +294,7 @@ static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
                           (io_rw_8*)&spi_get_hw(spi1)->dr, // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
+#ifdef WITH_PIO_SPI
     dma_channel_configure(dma_spi2_tx, &tx2_cfg,
                           (io_rw_8*)&(pio0->txf[0]), // write address
                           outgoing_frame_adc.bytes, // read address
@@ -343,32 +315,49 @@ static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
                           (io_rw_8*)&(pio1->rxf[0]), // read address
                           dma_encode_transfer_count(N_BYTES_IN_FRAME),
                           false); // start later...
-    // At this point, the outgoing data bytes are in place and ready to be sent via SPI0.
-    dma_start_channel_mask((1u << dma_spi0_tx) | (1u << dma_spi0_rx) |
-                           (1u << dma_spi1_tx) | (1u << dma_spi1_rx) |
-                           (1u << dma_spi2_tx) | (1u << dma_spi2_rx) |
-                           (1u << dma_spi3_tx) | (1u << dma_spi3_rx));
+#endif
+    // At this point, the outgoing data bytes are in place and ready to be sent via SPI.
+    uint32_t start_mask = (1u << dma_spi0_tx) | (1u << dma_spi0_rx);
+    start_mask |= (1u << dma_spi1_tx) | (1u << dma_spi1_rx);
+#ifdef WITH_PIO_SPI
+    start_mask |= (1u << dma_spi2_tx) | (1u << dma_spi2_rx);
+    start_mask |= (1u << dma_spi3_tx) | (1u << dma_spi3_rx);
+#endif
+    dma_start_channel_mask(start_mask);
     //
     // Wait for the data to be clocked out.
-    while (dma_channel_is_busy(dma_spi0_tx) || dma_channel_is_busy(dma_spi0_rx) ||
-           dma_channel_is_busy(dma_spi1_tx) || dma_channel_is_busy(dma_spi1_rx) ||
-           dma_channel_is_busy(dma_spi2_tx) || dma_channel_is_busy(dma_spi2_rx) ||
-           dma_channel_is_busy(dma_spi3_tx) || dma_channel_is_busy(dma_spi3_rx)) {
+    bool dma_is_busy = dma_channel_is_busy(dma_spi0_tx) || dma_channel_is_busy(dma_spi0_rx);
+    dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi1_tx) || dma_channel_is_busy(dma_spi1_rx);
+#ifdef WITH_PIO_SPI
+    dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi2_tx) || dma_channel_is_busy(dma_spi2_rx);
+    dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi3_tx) || dma_channel_is_busy(dma_spi3_rx);
+#endif
+    while (dma_is_busy) {
         if (time_reached(timeout)) {
             // Deselect the ADS131M04-x chips and get out, signalling time-out.
             gpio_put(CS_0_PIN, 1);
             gpio_put(CS_1_PIN, 1);
+#ifdef WITH_PIO_SPI
             gpio_put(CS_2_PIN, 1);
             gpio_put(CS_3_PIN, 1);
+#endif
             return 1;
         }
+        dma_is_busy = dma_channel_is_busy(dma_spi0_tx) || dma_channel_is_busy(dma_spi0_rx);
+        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi1_tx) || dma_channel_is_busy(dma_spi1_rx);
+#ifdef WITH_PIO_SPI
+        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi2_tx) || dma_channel_is_busy(dma_spi2_rx);
+        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi3_tx) || dma_channel_is_busy(dma_spi3_rx);
+#endif
     }
     // Normal completion, within time-out period.
     // Deselect the ADS131M04-x chips before leaving.
     gpio_put(CS_0_PIN, 1);
     gpio_put(CS_1_PIN, 1);
+#ifdef WITH_PIO_SPI
     gpio_put(CS_2_PIN, 1);
     gpio_put(CS_3_PIN, 1);
+#endif
     return 0;
 }
 
@@ -942,6 +931,7 @@ int main()
     channel_config_set_dreq(&tx1_cfg, spi_get_dreq(spi1, true)); // tx
     channel_config_set_dreq(&rx1_cfg, spi_get_dreq(spi1, false)); // rx
     //
+#ifdef WITH_PIO_SPI
     // We implement spi2 and spi3 with state machines in the PIO 0 and 1 modules.
     uint offset0 = pio_add_program(pio0, &spi_cpol0_cpha1_program);
     uint offset1 = pio_add_program(pio1, &spi_cpol0_cpha1_program);
@@ -999,6 +989,7 @@ int main()
     // The dma-transfer requests are paced by the PIO peripheral.
     channel_config_set_dreq(&tx3_cfg, pio_get_dreq(pio1, 0, true)); // tx
     channel_config_set_dreq(&rx3_cfg, pio_get_dreq(pio1, 0, false)); // rx
+#endif
     //
     // Configure SYNC pin for manual interaction.
     //
@@ -1049,18 +1040,19 @@ int main()
     dma_channel_cleanup(dma_spi0_rx);
     dma_channel_cleanup(dma_spi1_tx);
     dma_channel_cleanup(dma_spi1_rx);
-    dma_channel_cleanup(dma_spi2_tx);
-    dma_channel_cleanup(dma_spi2_rx);
-    dma_channel_cleanup(dma_spi3_tx);
-    dma_channel_cleanup(dma_spi3_rx);
-    //
     dma_channel_unclaim(dma_spi0_tx);
     dma_channel_unclaim(dma_spi0_rx);
     dma_channel_unclaim(dma_spi1_tx);
     dma_channel_unclaim(dma_spi1_rx);
+    #ifdef WITH_PIO_SPI
+    dma_channel_cleanup(dma_spi2_tx);
+    dma_channel_cleanup(dma_spi2_rx);
+    dma_channel_cleanup(dma_spi3_tx);
+    dma_channel_cleanup(dma_spi3_rx);
     dma_channel_unclaim(dma_spi2_tx);
     dma_channel_unclaim(dma_spi2_rx);
     dma_channel_unclaim(dma_spi3_tx);
     dma_channel_unclaim(dma_spi3_rx);
+    #endif
     return 0;
 }

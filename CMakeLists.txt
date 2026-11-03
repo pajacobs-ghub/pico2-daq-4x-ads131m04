@@ -24,7 +24,7 @@ add_executable(pico2_daq_4x_ads131m04)
 
 pico_generate_pio_header(pico2_daq_4x_ads131m04 ${CMAKE_CURRENT_LIST_DIR}/spi.pio)
 
-target_sources(pico2_daq_4x_ads131m04 PRIVATE pico2_daq.c)
+target_sources(pico2_daq_4x_ads131m04 PRIVATE pico2_daq.c pin_names.h)
 
 # pull in common dependencies
 target_link_libraries(pico2_daq_4x_ads131m04 PRIVATE
