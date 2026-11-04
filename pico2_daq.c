@@ -30,7 +30,7 @@
 
 #include "pin_names.h"
 
-#define VERSION_STR "v0.9 Pico2 as DAQ-MCU 2026-11-03"
+#define VERSION_STR "v0.10 Pico2 as DAQ-MCU 2026-11-04"
 
 // Nominally, we have 4 SPI ports or SPI-like ports,
 // each talking to individual ADC chip.
@@ -38,14 +38,7 @@
 //   spi1 is a true SPI port
 //   spi2 is a pio0-implemented SPI port
 //   spi3 is a pio1-implemented SPI port
-#define WITH_PIO_SPI
-#ifdef WITH_PIO_SPI
-// Use all SPI and PIO-SPI ports.
 const uint n_adc_chips = 4;
-#else
-// Use just the true SPI ports.
-const uint n_adc_chips = 2;
-#endif
 
 
 static inline void assert_ready()
@@ -109,7 +102,32 @@ typedef struct { uint8_t bytes[N_BYTES_IN_FRAME]; } BBuffer;
 static BBuffer outgoing_frame_adc;
 static BBuffer incoming_frame_adc[4];
 
-static int sampling_error_flag;
+// The data will be sent to (and received from) the SPI ports via DMA.
+// We use a DMA channel for each transmit and receive transaction.
+// channel-index  SPI port
+// 0              spi0_tx (true SPI module)
+// 1              spi0_rx
+// 2              spi1_tx (true SPI module)
+// 3              spi1_rx
+// 4              spi2_tx (PIO implemented SPI)
+// 5              spi2_rx
+// 6              spi3_tx (PIO implemented SPI)
+// 7              spi3_rx
+#define N_DMA_CHANNELS 8
+static uint dma_channel[N_DMA_CHANNELS];
+static dma_channel_config dma_cfg[N_DMA_CHANNELS];
+static io_rw_8 *dma_write_addr[N_DMA_CHANNELS];
+static io_rw_8 *dma_read_addr[N_DMA_CHANNELS];
+
+static int last_exchange_error;
+#define EX_ERR_NONE 0
+#define EX_ERR_DMA_DID_NOT_FINISH 1
+
+static uint dma_did_not_finish_mask;
+
+static int last_sampling_error;
+#define S_ERR_NONE 0
+#define S_ERR_ADC_CHIP_NO_RESPONSE 1
 
 // Options for over-sampling ratio in CLOCK register.
 const uint8_t OSR_128 = 0;
@@ -248,23 +266,15 @@ static inline void prepare_to_write_adc_clock_register(uint8_t OSR_bits, uint8_t
     prepare_to_write_adc_register(0x03, clock_reg);
 }
 
-static uint dma_spi0_tx, dma_spi0_rx, dma_spi1_tx, dma_spi1_rx;
-static dma_channel_config tx0_cfg, rx0_cfg, tx1_cfg, rx1_cfg;
-#ifdef WITH_PIO_SPI
-static uint dma_spi2_tx, dma_spi2_rx, dma_spi3_tx, dma_spi3_rx;
-static dma_channel_config tx2_cfg, rx2_cfg, tx3_cfg, rx3_cfg;
-#endif
-
 static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
 // Returns 0 on a successful transfer, 1 on time-out.
 {
+    last_exchange_error = EX_ERR_NONE; // Clear it out.
     // Select the ADS131M04 chips.
     gpio_put(CS_0_PIN, 0);
     gpio_put(CS_1_PIN, 0);
-#ifdef WITH_PIO_SPI
     gpio_put(CS_2_PIN, 0);
     gpio_put(CS_3_PIN, 0);
-#endif
     busy_wait_us(1);
     // spi_write_read_blocking(spi0, outgoing_bytes_adc, incoming_bytes_adc, N_BYTES_IN_FRAME);
     //
@@ -274,90 +284,50 @@ static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
     // this machinery by starting off exchanges with all 4 ADS131M04 chips letting
     // them independently complete.
     uint64_t timeout = time_us_64() + timeout_period_us;
-    dma_channel_configure(dma_spi0_tx, &tx0_cfg,
-                          (io_rw_8*)&spi_get_hw(spi0)->dr, // write address
-                          outgoing_frame_adc.bytes, // read address
-                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
-                          false); // start later...
-    dma_channel_configure(dma_spi0_rx, &rx0_cfg,
-                          incoming_frame_adc[0].bytes, // write address
-                          (io_rw_8*)&spi_get_hw(spi0)->dr, // read address
-                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
-                          false); // start later...
-    dma_channel_configure(dma_spi1_tx, &tx1_cfg,
-                          (io_rw_8*)&spi_get_hw(spi1)->dr, // write address
-                          outgoing_frame_adc.bytes, // read address
-                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
-                          false); // start later...
-    dma_channel_configure(dma_spi1_rx, &rx1_cfg,
-                          incoming_frame_adc[1].bytes, // write address
-                          (io_rw_8*)&spi_get_hw(spi1)->dr, // read address
-                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
-                          false); // start later...
-#ifdef WITH_PIO_SPI
-    dma_channel_configure(dma_spi2_tx, &tx2_cfg,
-                          (io_rw_8*)&(pio0->txf[0]), // write address
-                          outgoing_frame_adc.bytes, // read address
-                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
-                          false); // start later...
-    dma_channel_configure(dma_spi2_rx, &rx2_cfg,
-                          incoming_frame_adc[2].bytes, // write address
-                          (io_rw_8*)&(pio0->rxf[0]), // read address
-                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
-                          false); // start later...
-    dma_channel_configure(dma_spi3_tx, &tx3_cfg,
-                          (io_rw_8*)&(pio1->txf[0]), // write address
-                          outgoing_frame_adc.bytes, // read address
-                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
-                          false); // start later...
-    dma_channel_configure(dma_spi3_rx, &rx3_cfg,
-                          incoming_frame_adc[3].bytes, // write address
-                          (io_rw_8*)&(pio1->rxf[0]), // read address
-                          dma_encode_transfer_count(N_BYTES_IN_FRAME),
-                          false); // start later...
-#endif
+    // Configure DMA channels to start later.
+    uint32_t start_mask = 0;
+    for (uint i=0; i < N_DMA_CHANNELS; i++) {
+        dma_channel_configure(dma_channel[i], &dma_cfg[i], dma_write_addr[i], dma_read_addr[i],
+                              dma_encode_transfer_count(N_BYTES_IN_FRAME), false);
+        start_mask |= 1u << dma_channel[i];
+    }
     // At this point, the outgoing data bytes are in place and ready to be sent via SPI.
-    uint32_t start_mask = (1u << dma_spi0_tx) | (1u << dma_spi0_rx);
-    start_mask |= (1u << dma_spi1_tx) | (1u << dma_spi1_rx);
-#ifdef WITH_PIO_SPI
-    start_mask |= (1u << dma_spi2_tx) | (1u << dma_spi2_rx);
-    start_mask |= (1u << dma_spi3_tx) | (1u << dma_spi3_rx);
-#endif
     dma_start_channel_mask(start_mask);
     //
     // Wait for the data to be clocked out.
-    bool dma_is_busy = dma_channel_is_busy(dma_spi0_tx) || dma_channel_is_busy(dma_spi0_rx);
-    dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi1_tx) || dma_channel_is_busy(dma_spi1_rx);
-#ifdef WITH_PIO_SPI
-    dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi2_tx) || dma_channel_is_busy(dma_spi2_rx);
-    dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi3_tx) || dma_channel_is_busy(dma_spi3_rx);
-#endif
+    bool dma_is_busy = false;
+    for (uint i=0; i < N_DMA_CHANNELS; i++) {
+        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_channel[i]);
+    }
     while (dma_is_busy) {
         if (time_reached(timeout)) {
             // Deselect the ADS131M04-x chips and get out, signalling time-out.
             gpio_put(CS_0_PIN, 1);
             gpio_put(CS_1_PIN, 1);
-#ifdef WITH_PIO_SPI
             gpio_put(CS_2_PIN, 1);
             gpio_put(CS_3_PIN, 1);
-#endif
+            last_exchange_error = EX_ERR_DMA_DID_NOT_FINISH;
+            dma_did_not_finish_mask = 0;
+            for (uint i=0; i < N_DMA_CHANNELS; i++) {
+                if (dma_channel_is_busy(dma_channel[i])) {
+                    dma_did_not_finish_mask |= 1u << i;
+                    dma_channel_abort(dma_channel[i]);
+                }
+            }
             return 1;
         }
-        dma_is_busy = dma_channel_is_busy(dma_spi0_tx) || dma_channel_is_busy(dma_spi0_rx);
-        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi1_tx) || dma_channel_is_busy(dma_spi1_rx);
-#ifdef WITH_PIO_SPI
-        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi2_tx) || dma_channel_is_busy(dma_spi2_rx);
-        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_spi3_tx) || dma_channel_is_busy(dma_spi3_rx);
-#endif
+        busy_wait_us(10);
+        dma_is_busy = false;
+        for (uint i=0; i < N_DMA_CHANNELS; i++) {
+            dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_channel[i]);
+        }
     }
     // Normal completion, within time-out period.
     // Deselect the ADS131M04-x chips before leaving.
     gpio_put(CS_0_PIN, 1);
     gpio_put(CS_1_PIN, 1);
-#ifdef WITH_PIO_SPI
     gpio_put(CS_2_PIN, 1);
     gpio_put(CS_3_PIN, 1);
-#endif
     return 0;
 }
 
@@ -407,7 +377,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint16_t trigger_level = (uint16_t) vregister[TRIG_LEVEL];
     uint8_t trigger_slope = (uint8_t)vregister[TRIG_SLOPE];
     //
-    sampling_error_flag = 0;
+    last_sampling_error = 0;
     next_fullword_index_in_data = 0; // Start afresh, at index 0.
     fullword_index_has_wrapped_around = 0;
     uint8_t post_event = 0;
@@ -526,7 +496,7 @@ void sample_channels_once()
     // two sample reads will be made because there will be 1 sample
     // leading to the immediate trigger event and one after trigger.
     // It should not matter.
-    sampling_error_flag = sample_channels();
+    last_sampling_error = sample_channels();
     //
     // Restore register values.
     vregister[TRIG_MODE] = mode_save;
@@ -775,12 +745,13 @@ void interpret_command(char* cmdStr)
         // The task takes an indefinite time,
         // so let the COMMS_MCU know via busy# pin.
         assert_not_ready();
-        sampling_error_flag = sample_channels();
+        last_sampling_error = sample_channels();
         assert_ready();
         break;
     case 'k':
-        // Report the value of the sampling_error_flag flag.
-        printf("k %u ok\n", sampling_error_flag);
+        // Report the value of the last_sampling_error and last_exchange_error codes.
+        printf("%d %d %u ok\n", last_sampling_error, last_exchange_error,
+               dma_did_not_finish_mask);
         break;
     case 'I':
         // Immediately take a single sample set and report values.
@@ -863,6 +834,24 @@ int main()
 	sampling_LED_OFF(); sleep_ms(500);
 	sampling_LED_ON(); sleep_ms(500);
 	sampling_LED_OFF();
+    //
+    // Transfer bytes to and from each of the ADC chips via a pair of DMA channels.
+    // Start with a generic config for each TX and RX channel.
+    //
+    for (uint i=0; i < n_adc_chips; i++) {
+        uint itx = i*2;
+        dma_channel[itx] = dma_claim_unused_channel(true);
+        dma_cfg[itx] = dma_channel_get_default_config(dma_channel[itx]);
+        channel_config_set_transfer_data_size(&dma_cfg[itx], DMA_SIZE_8);
+        channel_config_set_read_increment(&dma_cfg[itx], true);
+        channel_config_set_write_increment(&dma_cfg[itx], false);
+        uint irx = itx+1;
+        dma_channel[irx] = dma_claim_unused_channel(true);
+        dma_cfg[irx] = dma_channel_get_default_config(dma_channel[irx]);
+        channel_config_set_transfer_data_size(&dma_cfg[irx], DMA_SIZE_8);
+        channel_config_set_read_increment(&dma_cfg[irx], false);
+        channel_config_set_write_increment(&dma_cfg[irx], true);
+    }
 	//
 	// Configure pins to drive the ADS131M04-0 chip with SPI0.
 	//
@@ -882,20 +871,14 @@ int main()
     gpio_init(DRDY_0_PIN);
     gpio_set_dir(DRDY_0_PIN, GPIO_IN);
     //
-    // Transfer bytes to and from the SPI0 peripheral via DMA channels.
-    dma_spi0_tx = dma_claim_unused_channel(true);
-    dma_spi0_rx = dma_claim_unused_channel(true);
-    tx0_cfg = dma_channel_get_default_config(dma_spi0_tx);
-    rx0_cfg = dma_channel_get_default_config(dma_spi0_rx);
-    channel_config_set_transfer_data_size(&tx0_cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&tx0_cfg, true);
-    channel_config_set_write_increment(&tx0_cfg, false);
-    channel_config_set_transfer_data_size(&rx0_cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&rx0_cfg, false);
-    channel_config_set_write_increment(&rx0_cfg, true);
     // The dma-transfer requests are paced by the SPI peripheral.
-    channel_config_set_dreq(&tx0_cfg, spi_get_dreq(spi0, true)); // tx
-    channel_config_set_dreq(&rx0_cfg, spi_get_dreq(spi0, false)); // rx
+    channel_config_set_dreq(&dma_cfg[0], spi_get_dreq(spi0, true)); // tx
+    channel_config_set_dreq(&dma_cfg[1], spi_get_dreq(spi0, false)); // rx
+    // Write and read addresses for the channels.
+    dma_write_addr[0] = (io_rw_8*)&spi_get_hw(spi0)->dr;
+    dma_read_addr[0] = outgoing_frame_adc.bytes;
+    dma_write_addr[1] = incoming_frame_adc[0].bytes;
+    dma_read_addr[1] = (io_rw_8*)&spi_get_hw(spi0)->dr;
 	//
 	// Configure pins to drive the ADS131M04-1 chip with SPI1.
 	//
@@ -916,22 +899,15 @@ int main()
     gpio_init(DRDY_1_PIN);
     gpio_set_dir(DRDY_1_PIN, GPIO_IN);
     //
-    // Transfer bytes to and from the SPI1 peripheral via DMA channels.
-    dma_spi1_tx = dma_claim_unused_channel(true);
-    dma_spi1_rx = dma_claim_unused_channel(true);
-    tx1_cfg = dma_channel_get_default_config(dma_spi1_tx);
-    rx1_cfg = dma_channel_get_default_config(dma_spi1_rx);
-    channel_config_set_transfer_data_size(&tx1_cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&tx1_cfg, true);
-    channel_config_set_write_increment(&tx1_cfg, false);
-    channel_config_set_transfer_data_size(&rx1_cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&rx1_cfg, false);
-    channel_config_set_write_increment(&rx1_cfg, true);
     // The dma-transfer requests are paced by the SPI peripheral.
-    channel_config_set_dreq(&tx1_cfg, spi_get_dreq(spi1, true)); // tx
-    channel_config_set_dreq(&rx1_cfg, spi_get_dreq(spi1, false)); // rx
+    channel_config_set_dreq(&dma_cfg[2], spi_get_dreq(spi1, true)); // tx
+    channel_config_set_dreq(&dma_cfg[3], spi_get_dreq(spi1, false)); // rx
+    // Write and read addresses for the channels.
+    dma_write_addr[2] = (io_rw_8*)&spi_get_hw(spi1)->dr;
+    dma_read_addr[2] = outgoing_frame_adc.bytes;
+    dma_write_addr[3] = incoming_frame_adc[1].bytes;
+    dma_read_addr[3] = (io_rw_8*)&spi_get_hw(spi1)->dr;
     //
-#ifdef WITH_PIO_SPI
     // We implement spi2 and spi3 with state machines in the PIO 0 and 1 modules.
     uint offset0 = pio_add_program(pio0, &spi_cpol0_cpha1_program);
     uint offset1 = pio_add_program(pio1, &spi_cpol0_cpha1_program);
@@ -948,20 +924,14 @@ int main()
     gpio_init(DRDY_2_PIN);
     gpio_set_dir(DRDY_2_PIN, GPIO_IN);
     //
-    // Transfer bytes to and from the spi2 peripheral via DMA channels.
-    dma_spi2_tx = dma_claim_unused_channel(true);
-    dma_spi2_rx = dma_claim_unused_channel(true);
-    tx2_cfg = dma_channel_get_default_config(dma_spi2_tx);
-    rx2_cfg = dma_channel_get_default_config(dma_spi2_rx);
-    channel_config_set_transfer_data_size(&tx2_cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&tx2_cfg, true);
-    channel_config_set_write_increment(&tx2_cfg, false);
-    channel_config_set_transfer_data_size(&rx2_cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&rx2_cfg, false);
-    channel_config_set_write_increment(&rx2_cfg, true);
     // The dma-transfer requests are paced by the PIO peripheral.
-    channel_config_set_dreq(&tx2_cfg, pio_get_dreq(pio0, 0, true)); // tx
-    channel_config_set_dreq(&rx2_cfg, pio_get_dreq(pio0, 0, false)); // rx
+    channel_config_set_dreq(&dma_cfg[4], pio_get_dreq(pio0, 0, true)); // tx
+    channel_config_set_dreq(&dma_cfg[5], pio_get_dreq(pio0, 0, false)); // rx
+    // Write and read addresses for the channels.
+    dma_write_addr[4] = (io_rw_8*)&pio0->txf[0];
+    dma_read_addr[4] = outgoing_frame_adc.bytes;
+    dma_write_addr[5] = incoming_frame_adc[2].bytes;
+    dma_read_addr[5] = (io_rw_8*)&pio0->rxf[0];
     //
     // Configure pins to drive the ADS131M04-3 chip via pio1 sm=0 implementing spi3
     //
@@ -975,21 +945,14 @@ int main()
     gpio_init(DRDY_3_PIN);
     gpio_set_dir(DRDY_3_PIN, GPIO_IN);
     //
-    // Transfer bytes to and from the spi3 peripheral via DMA channels.
-    dma_spi3_tx = dma_claim_unused_channel(true);
-    dma_spi3_rx = dma_claim_unused_channel(true);
-    tx3_cfg = dma_channel_get_default_config(dma_spi3_tx);
-    rx3_cfg = dma_channel_get_default_config(dma_spi3_rx);
-    channel_config_set_transfer_data_size(&tx3_cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&tx3_cfg, true);
-    channel_config_set_write_increment(&tx3_cfg, false);
-    channel_config_set_transfer_data_size(&rx3_cfg, DMA_SIZE_8);
-    channel_config_set_read_increment(&rx3_cfg, false);
-    channel_config_set_write_increment(&rx3_cfg, true);
     // The dma-transfer requests are paced by the PIO peripheral.
-    channel_config_set_dreq(&tx3_cfg, pio_get_dreq(pio1, 0, true)); // tx
-    channel_config_set_dreq(&rx3_cfg, pio_get_dreq(pio1, 0, false)); // rx
-#endif
+    channel_config_set_dreq(&dma_cfg[6], pio_get_dreq(pio1, 0, true)); // tx
+    channel_config_set_dreq(&dma_cfg[7], pio_get_dreq(pio1, 0, false)); // rx
+    // Write and read addresses for the channels.
+    dma_write_addr[6] = (io_rw_8*)&pio1->txf[0];
+    dma_read_addr[6] = outgoing_frame_adc.bytes;
+    dma_write_addr[7] = incoming_frame_adc[3].bytes;
+    dma_read_addr[7] = (io_rw_8*)&pio1->rxf[0];
     //
     // Configure SYNC pin for manual interaction.
     //
@@ -1036,23 +999,9 @@ int main()
     spi_deinit(spi0);
     spi_deinit(spi1);
     //
-    dma_channel_cleanup(dma_spi0_tx);
-    dma_channel_cleanup(dma_spi0_rx);
-    dma_channel_cleanup(dma_spi1_tx);
-    dma_channel_cleanup(dma_spi1_rx);
-    dma_channel_unclaim(dma_spi0_tx);
-    dma_channel_unclaim(dma_spi0_rx);
-    dma_channel_unclaim(dma_spi1_tx);
-    dma_channel_unclaim(dma_spi1_rx);
-    #ifdef WITH_PIO_SPI
-    dma_channel_cleanup(dma_spi2_tx);
-    dma_channel_cleanup(dma_spi2_rx);
-    dma_channel_cleanup(dma_spi3_tx);
-    dma_channel_cleanup(dma_spi3_rx);
-    dma_channel_unclaim(dma_spi2_tx);
-    dma_channel_unclaim(dma_spi2_rx);
-    dma_channel_unclaim(dma_spi3_tx);
-    dma_channel_unclaim(dma_spi3_rx);
-    #endif
+    for (uint i=0; i < N_DMA_CHANNELS; i++) {
+        dma_channel_cleanup(dma_channel[i]);
+        dma_channel_unclaim(dma_channel[i]);
+    }
     return 0;
 }
