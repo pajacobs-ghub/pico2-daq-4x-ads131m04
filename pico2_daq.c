@@ -30,7 +30,7 @@
 
 #include "pin_names.h"
 
-#define VERSION_STR "v0.10 Pico2 as DAQ-MCU 2026-11-04"
+#define VERSION_STR "v0.11 Pico2 as DAQ-MCU 2026-11-05"
 
 // Nominally, we have 4 SPI ports or SPI-like ports,
 // each talking to individual ADC chip.
@@ -169,7 +169,7 @@ const uint TRIG_SLOPE = 8;
 void set_registers_to_original_values()
 {
 	// Master clock frequency selected to give low-power operation.
-    vregister[MCLK_KHZ] = 8192/2; // Master clock frequency f_CLKIN for ADS131M04, in kHz
+    vregister[MCLK_KHZ] = 4096; // Master clock frequency f_CLKIN for ADS131M04, in kHz
     vregister[OSR_SELECT] = OSR_512;  // Selection bits for over-sampling ratio.
     vregister[PWR_SELECT] = LOW_POWER; // power select bits need to match MCLK setting.
     // See Table 8-2 in the ADS131M04 data sheet for acceptable combinations
@@ -232,10 +232,13 @@ static inline int wait_for_data_ready_adc0(uint64_t timeout)
 
 static inline void prepare_adc_command(uint16_t cmd)
 // Set up outgoing buffer data for a simple command at next full-frame exchange.
+// Assume that we are working with the default 24-bit word size of the ADS131M04
+// and that we have not enabled the CRC.
 {
     outgoing_frame_adc.bytes[0] = (uint8_t)((cmd & 0xff00) >> 8);
     outgoing_frame_adc.bytes[1] = (uint8_t)(cmd & 0x00ff);
-    for (uint i = 2; i < N_BYTES_IN_FRAME; ++i) {
+    outgoing_frame_adc.bytes[2] = 0; // zero-pad the 24-bit word
+    for (uint i = 3; i < N_BYTES_IN_FRAME; ++i) {
         outgoing_frame_adc.bytes[i] = (uint8_t)0;
     }
 }
@@ -243,6 +246,10 @@ static inline void prepare_adc_command(uint16_t cmd)
 static inline void prepare_to_write_adc_register(uint8_t reg_addr, uint16_t reg_value)
 // Set up outgoing buffer data to write a 16-bit value to an ADS131M04 register
 // at the next full-frame exchange.
+//
+// Assume that we are working with the default 24-bit word size of the ADS131M04
+// and that we have not enabled the CRC.
+//
 // The WREG command format is: 011a aaaa annn nnnn
 // where a is the register address and
 //       n is the number of registers to write minus 1.
@@ -251,9 +258,12 @@ static inline void prepare_to_write_adc_register(uint8_t reg_addr, uint16_t reg_
     uint16_t cmd = 0x6000 | ((reg_addr & 0x3f) << 7); // WREG command with address
     outgoing_frame_adc.bytes[0] = (uint8_t)((cmd & 0xff00) >> 8);
     outgoing_frame_adc.bytes[1] = (uint8_t)(cmd & 0x00ff);
-    outgoing_frame_adc.bytes[2] = (uint8_t)((reg_value & 0xff00) >> 8);
-    outgoing_frame_adc.bytes[3] = (uint8_t)(reg_value & 0x00ff);
-    for (uint i = 4; i < N_BYTES_IN_FRAME; ++i) {
+    outgoing_frame_adc.bytes[2] = 0; // zero-pad the 24-bit word
+    // Second word contains the 16-bit value to be written into the register.
+    outgoing_frame_adc.bytes[3] = (uint8_t)((reg_value & 0xff00) >> 8);
+    outgoing_frame_adc.bytes[4] = (uint8_t)(reg_value & 0x00ff);
+    outgoing_frame_adc.bytes[5] = 0; // zero-pad the 24-bit word
+    for (uint i = 6; i < N_BYTES_IN_FRAME; ++i) {
         outgoing_frame_adc.bytes[i] = (uint8_t)0;
     }
 }
@@ -367,11 +377,15 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
 {
     // Get configuration data from virtual registers.
     uint32_t f_CLKIN_kHz = vregister[MCLK_KHZ];
+    float period_CLKIN_us = 1000.0f / f_CLKIN_kHz;
+    uint32_t sync_duration_us = (uint32_t)ceil(30.0f * period_CLKIN_us);
+    uint32_t reset_duration_us = (uint32_t)ceil(3000.0f * period_CLKIN_us);
+    //
     uint8_t OSR_bits = (uint8_t)vregister[OSR_SELECT];
     int32_t sample_period_us = 2000L * OSR_value[OSR_bits] / f_CLKIN_kHz;
     uint8_t PWR_bits = (uint8_t)vregister[PWR_SELECT];
     //
-    uint8_t N_CHAN = (uint8_t)vregister[NCHANNELS];
+    uint8_t n_analog_channels = (uint8_t)vregister[NCHANNELS];
     uint8_t mode = (uint8_t)vregister[TRIG_MODE];
     uint8_t trigger_chan = (uint8_t)vregister[TRIG_CHAN];
     uint16_t trigger_level = (uint16_t) vregister[TRIG_LEVEL];
@@ -382,6 +396,11 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     fullword_index_has_wrapped_around = 0;
     uint8_t post_event = 0;
     uint32_t samples_remaining = vregister[NSAMPLES];
+    //
+    // Put sentinel values into the sample-data array,
+    // so that we can more easily see when data is not being collected.
+    // The value of -1, although valid data, is very unlikely.
+    for (uint i=0; i < MAX_N_CHAN; i++) { sample_data[i] = -1; }
     //
     // Start driving the ADS131M04 chips with a master clock via a PWM slice.
     // According to table 677 in the RP2350 data sheet,
@@ -395,6 +414,9 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     pwm_set_clkdiv(slice_num, div);
     pwm_set_enabled(slice_num, true);
     busy_wait_us(500); // Let the ADS131M04 clock and internal circuits settle.
+    // Assert the SYNCHn pin to reset the ADS131M04 chips.
+    uint64_t timeout = time_us_64() + 10;
+    if (assert_adc_synch(reset_duration_us, timeout)) return 98;
     //
     // Set the OSR and PWR in the CLOCK register before the first SYNC.
     prepare_to_write_adc_clock_register(OSR_bits, PWR_bits);
@@ -405,7 +427,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     exchange_full_frame_adc0123(100);
     // Read the response.
     prepare_adc_command(0); // NULL command
-    uint64_t timeout = time_us_64() + 10000; // 10ms timeout
+    timeout = time_us_64() + 10000; // 10ms timeout
     if (wait_for_data_ready_adc0(timeout)) return 4;
     busy_wait_us(1);
     exchange_full_frame_adc0123(100);
@@ -413,11 +435,10 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // sitting in the incoming buffer.
     // FIX-ME PJ 2026-10-21 we should check that the register was written.
     //
-    // Assert the SYNCHn pin to reset the ADS131M04 and activate sampling
-    // with the new OSR setting.
+    // Assert the SYNCHn pin to synchronise the ADS131M04
+    // and activate sampling with the new clock-register setting.
     timeout = time_us_64() + 10;
-    uint64_t period_CLKIN_ns = 1000000 / f_CLKIN_kHz;
-    if (assert_adc_synch(3*period_CLKIN_ns, timeout)) return 99;
+    if (assert_adc_synch(sync_duration_us, timeout)) return 99;
     //
     // After SYNC, the filter needs time to settle based on the OSR value.
     // Per datasheet Table 8-3, settling times vary by OSR and
@@ -440,7 +461,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         busy_wait_us(1);
         exchange_full_frame_adc0123(100);
         unpack_adc_sample_data();
-        for (uint ch=0; ch < N_CHAN; ++ch) {
+        for (uint ch=0; ch < n_analog_channels; ++ch) {
             data[next_fullword_index_in_data+ch] = sample_data[ch];
         }
         //
@@ -471,7 +492,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
             } // end switch
         }
         // Point to the next available fullword index.
-        next_fullword_index_in_data += N_CHAN;
+        next_fullword_index_in_data += n_analog_channels;
         if (next_fullword_index_in_data >= N_FULLWORDS) {
             next_fullword_index_in_data -= N_FULLWORDS;
             fullword_index_has_wrapped_around = 1;
@@ -509,15 +530,15 @@ char str_buf1[NSTRBUF1];
 #define NSTRBUF2 16
 char str_buf2[NSTRBUF2];
 
-char* sample_set_to_str(uint32_t n)
+char* sample_set_to_str(uint32_t i)
 {
     // Start with index of oldest sample, then move to selected sample.
-    uint8_t N_CHAN = (uint8_t)vregister[NCHANNELS];
-    uint32_t word_index = oldest_fullword_index_in_data() + N_CHAN*n;
+    uint8_t n_analog_channels = (uint8_t)vregister[NCHANNELS];
+    uint32_t word_index = oldest_fullword_index_in_data() + n_analog_channels*i;
     // Assume that the fullword sets in the data wrap neatly.
-	if (word_index > N_FULLWORDS) { word_index -= N_FULLWORDS; }
+	while (word_index > N_FULLWORDS) { word_index -= N_FULLWORDS; }
     snprintf(str_buf1, NSTRBUF1, "%d", data[word_index+0]);
-    for (uint8_t ch=1; ch < N_CHAN; ch++) {
+    for (uint8_t ch=1; ch < n_analog_channels; ch++) {
         snprintf(str_buf2, NSTRBUF2, " %d", data[word_index+ch]);
         strncat(str_buf1, str_buf2, NSTRBUF2);
     }
