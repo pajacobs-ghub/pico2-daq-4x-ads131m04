@@ -10,6 +10,7 @@
 //    an arrangement that uses DMA channels to send data to and
 //    collect data from the SPI0 module.
 //    2026-11-01: Add SPI-2 and SPI-3 implementations via PIO.
+//    2026-11-08: Add command to report sample set encoded as a base64 string.
 
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
@@ -29,8 +30,9 @@
 #include "hardware/structs/pio.h"
 
 #include "pin_names.h"
+#include "crc16.h"
 
-#define VERSION_STR "v0.11 Pico2 as DAQ-MCU 2026-11-05"
+#define VERSION_STR "v0.12 Pico2 as DAQ-MCU 2026-11-08"
 
 // Nominally, we have 4 SPI ports or SPI-like ports,
 // each talking to individual ADC chip.
@@ -60,7 +62,8 @@ static inline void assert_event()
 static inline void release_event()
 {
 	gpio_set_dir(EVENT_PIN, GPIO_IN);
-    gpio_pull_up(EVENT_PIN);
+    // Don't activate pull-up because there is an external 22k resistor
+    // trying to pull this line to V_SYS.
 }
 
 static inline uint8_t read_system_event_pin()
@@ -82,8 +85,8 @@ static inline void sampling_LED_OFF()
 }
 
 // A place for the current sample set.
-#define MAX_N_CHAN 16
-static int32_t sample_data[MAX_N_CHAN];
+#define MAX_N_ANALOG_CHANNELS 16
+static int32_t sample_data[MAX_N_ANALOG_CHANNELS];
 
 // A place to collect the sample sets as they come in from the ADC chips.
 #define N_FULLWORDS 0x00010000
@@ -176,7 +179,7 @@ void set_registers_to_original_values()
     // and the resultant data output rates.
     // With LOW-POWER mode, f_CLKIN=4.096 MHz, f_MOD=2.048 MHz, OSR=512
     // f_DATA = f_MOD / OSR = 4 kSps
-    vregister[NCHANNELS] = (n_adc_chips == 4) ? 16 : 8; // number of active analog channels
+    vregister[NCHANNELS] = 16; // number of active analog channels
     vregister[NSAMPLES] = 128; // number of samples in record after trigger event
     vregister[TRIG_MODE] = TRIGGER_IMMEDIATE;
     vregister[TRIG_CHAN] = 0; // trigger channel for internal trigger
@@ -400,7 +403,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // Put sentinel values into the sample-data array,
     // so that we can more easily see when data is not being collected.
     // The value of -1, although valid data, is very unlikely.
-    for (uint i=0; i < MAX_N_CHAN; i++) { sample_data[i] = -1; }
+    for (uint i=0; i < MAX_N_ANALOG_CHANNELS; i++) { sample_data[i] = -1; }
     //
     // Start driving the ADS131M04 chips with a master clock via a PWM slice.
     // According to table 677 in the RP2350 data sheet,
@@ -531,6 +534,8 @@ char str_buf1[NSTRBUF1];
 char str_buf2[NSTRBUF2];
 
 char* sample_set_to_str(uint32_t i)
+// Report the analog values for sample set i as decimal integers.
+// Returns a pointer to the fixed buffer holding the string.
 {
     // Start with index of oldest sample, then move to selected sample.
     uint8_t n_analog_channels = (uint8_t)vregister[NCHANNELS];
@@ -545,27 +550,57 @@ char* sample_set_to_str(uint32_t i)
     return str_buf1;
 }
 
-char* mem_dump_to_str(uint32_t addr)
-// Write a 32-byte page of sample data into the serial buffer as hex digits
-// representing the 16-bit converted samples. Use big-endian format.
-// Finally, return a pointer to the buffer.
-//
-// FIX-ME PJ 2026-10-19 Adapt to the 24-bit data from the ADS131M04.
-//
+//   0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+const char base64_alphabet[64] = {
+	'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
+	'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f',
+	'g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v',
+	'w','x','y','z','0','1','2','3','4','5','6','7','8','9','+','/'
+};
+
+void base64_encode(int32_t val, char b[4]) {
+    // Encode the 24-bit analog value as 4 base64 characters, storing them in array b.
+    // In the output array, the most-significant bits come first. (big-endian format)
+    uint indx = ((uint)val & (0x3f << 18)) >> 18;
+    b[0] = base64_alphabet[indx];
+    indx = ((uint)val & (0x3f << 12)) >> 12;
+    b[1] = base64_alphabet[indx];
+    indx = ((uint)val & (0x3f << 6)) >> 6;
+    b[2] = base64_alphabet[indx];
+    indx = (uint)val & 0x3f;
+    b[3] = base64_alphabet[indx];
+    return;
+}
+
+char* sample_set_to_base64_str(uint32_t i)
+// Report the analog values for sample set i as a base64-encoded string.
+// The 24-bit values are each represented by 4 base64 characters, big-endian format.
+// Returns a pointer to the fixed buffer holding the string.
 {
-    // Assume that the byte address is correctly aligned and
-    // that there are 16 2-byte values to send.
-	uint32_t ihw = addr / 2; // half-word index
-    uint8_t high_byte = (uint8_t) ((data[ihw] & 0xff00) >> 8);
-    uint8_t low_byte = (uint8_t) (data[ihw] & 0x00ff);
-    snprintf(str_buf1, NSTRBUF1, "%02x%02x", high_byte, low_byte);
-    for (uint8_t ch=1; ch < 16; ch++) {
-        high_byte = (uint8_t) ((data[ihw+ch] & 0xff00) >> 8);
-        low_byte = (uint8_t) (data[ihw+ch] & 0x00ff);
-        snprintf(str_buf2, NSTRBUF2, "%02x%02x", high_byte, low_byte);
+    // Start with index of oldest sample, then move to selected sample.
+    uint8_t n_analog_channels = (uint8_t)vregister[NCHANNELS];
+    uint32_t word_index = oldest_fullword_index_in_data() + n_analog_channels*i;
+    // Assume that the fullword sets in the data wrap neatly.
+	while (word_index > N_FULLWORDS) { word_index -= N_FULLWORDS; }
+    //
+    char b[4];
+    base64_encode(data[word_index+0], b);
+    snprintf(str_buf1, NSTRBUF1, "%c%c%c%c", b[0], b[1], b[2], b[3]);
+    for (uint8_t ch=1; ch < n_analog_channels; ch++) {
+        base64_encode(data[word_index+ch], b);
+        snprintf(str_buf2, NSTRBUF2, "%c%c%c%c", b[0], b[1], b[2], b[3]);
         strncat(str_buf1, str_buf2, NSTRBUF2);
     }
-	return str_buf1;
+    //
+    // Append the CRC16 for the base64 characters that are in the buffer.
+    uint16_t crc = crc16b((uint8_t *)str_buf1, 4*n_analog_channels, 0xffff);
+    uint8_t high_byte = (uint8_t) ((crc & 0xff00) >> 8);
+    uint8_t low_byte = (uint8_t) (crc & 0x00ff);
+    snprintf(str_buf2, NSTRBUF2, " %02x%02x", high_byte, low_byte);
+    strncat(str_buf1, str_buf2, NSTRBUF2);
+    //
+    // Finally, return the pointer to the constructed string.
+    return str_buf1;
 }
 
 
@@ -722,7 +757,7 @@ void interpret_command(char* cmdStr)
         printf("vregisters reset ok\n");
         break;
     case 'b':
-        // Byte size of sample set.
+        // Byte size of sample set stored in SRAM.
         printf("%d ok\n", byte_size_of_sample_set());
         break;
     case 'm':
@@ -744,19 +779,6 @@ void interpret_command(char* cmdStr)
     case 'N':
         // Size of data storage in 32-byte pages.
         printf("%d ok\n", N_FULLWORDS/8);
-        break;
-    case 'M':
-        // FIX-ME PJ 2026-10-19 Need to implement for this board.
-        // Page of bytes (in big-endian format) representing 16 2-byte values.
-        // Start at the specified byte-index within the stored data.
-        token_ptr = strtok(&cmdStr[1], sep_tok);
-        if (token_ptr) {
-            // Found some nonblank text, assume byte-index.
-            uint32_t addr = (uint32_t) atoi(token_ptr);
-            printf("%s ok\n", mem_dump_to_str(addr));
-        } else {
-            printf("fail: no byte-index specified.\n");
-        }
         break;
     case 'g':
         // Start the sampling process.
@@ -785,11 +807,25 @@ void interpret_command(char* cmdStr)
     case 'P':
         // Report the selected sample set for the configured channels.
         // An index of 0 refers to the oldest sample set.
+        // The format is a set of space-separated decimal integers.
         token_ptr = strtok(&cmdStr[1], sep_tok);
         if (token_ptr) {
             // Found some nonblank text, assume sample index.
             uint32_t ii = (uint32_t) atol(token_ptr);
             printf("%s ok\n", sample_set_to_str(ii));
+        } else {
+            printf("fail: no index given.\n");
+        }
+        break;
+    case 'B':
+        // Report the selected sample set for the configured channels.
+        // An index of 0 refers to the oldest sample set.
+        // The format is a packed base64 string followed by a 16-bit CRC in hexadecimal.
+        token_ptr = strtok(&cmdStr[1], sep_tok);
+        if (token_ptr) {
+            // Found some nonblank text, assume sample index.
+            uint32_t ii = (uint32_t) atol(token_ptr);
+            printf("%s ok\n", sample_set_to_base64_str(ii));
         } else {
             printf("fail: no index given.\n");
         }
