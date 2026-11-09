@@ -11,6 +11,7 @@
 //    collect data from the SPI0 module.
 //    2026-11-01: Add SPI-2 and SPI-3 implementations via PIO.
 //    2026-11-08: Add command to report sample set encoded as a base64 string.
+//    2026-11-10: Add option to set channel gains.
 
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
@@ -32,7 +33,7 @@
 #include "pin_names.h"
 #include "crc16.h"
 
-#define VERSION_STR "v0.12 Pico2 as DAQ-MCU 2026-11-08"
+#define VERSION_STR "v0.13 Pico2 as DAQ-MCU 2026-11-10"
 
 // Nominally, we have 4 SPI ports or SPI-like ports,
 // each talking to individual ADC chip.
@@ -128,6 +129,7 @@ static int last_exchange_error;
 
 static uint dma_did_not_finish_mask;
 
+static uint8_t did_not_keep_up_during_sampling;
 static int last_sampling_error;
 #define S_ERR_NONE 0
 #define S_ERR_ADC_CHIP_NO_RESPONSE 1
@@ -149,6 +151,17 @@ const uint8_t VERY_LOW_POWER = 0;
 const uint8_t LOW_POWER = 1;
 const uint8_t HIGH_RESOLUTION = 2;
 
+// Options for the GAIN1 register.
+const uint8_t PGAGAIN_1 = 0;
+const uint8_t PGAGAIN_2 = 1;
+const uint8_t PGAGAIN_4 = 2;
+const uint8_t PGAGAIN_8 = 3;
+const uint8_t PGAGAIN_16 = 4;
+const uint8_t PGAGAIN_32 = 5;
+const uint8_t PGAGAIN_64 = 6;
+const uint8_t PGAGAIN_128 = 7;
+
+// Options for the trigger event.
 const uint8_t TRIGGER_IMMEDIATE = 0;
 const uint8_t TRIGGER_INTERNAL = 1;
 const uint8_t TRIGGER_EXTERNAL = 2;
@@ -157,7 +170,7 @@ const uint8_t SLOPE_NEG = 0;
 const uint8_t SLOPE_POS = 1;
 
 // Parameters controlling the device are stored in virtual config registers.
-#define NUMREG 9
+#define NUMREG 13
 int32_t vregister[NUMREG];
 const uint MCLK_KHZ = 0;
 const uint OSR_SELECT = 1;
@@ -168,6 +181,10 @@ const uint TRIG_MODE = 5;
 const uint TRIG_CHAN = 6;
 const uint TRIG_LEVEL = 7;
 const uint TRIG_SLOPE = 8;
+const uint GAIN_AIN0 = 9;
+const uint GAIN_AIN1 = 10;
+const uint GAIN_AIN2 = 11;
+const uint GAIN_AIN3 = 12;
 
 void set_registers_to_original_values()
 {
@@ -185,6 +202,11 @@ void set_registers_to_original_values()
     vregister[TRIG_CHAN] = 0; // trigger channel for internal trigger
     vregister[TRIG_LEVEL] = 10000; // trigger level as a signed integer
     vregister[TRIG_SLOPE] = SLOPE_POS;
+    // All ADC chips use receive the same set of PGA selections.
+    vregister[GAIN_AIN0] = PGAGAIN_1;
+    vregister[GAIN_AIN1] = PGAGAIN_1;
+    vregister[GAIN_AIN2] = PGAGAIN_1;
+    vregister[GAIN_AIN3] = PGAGAIN_1;
 }
 
 static inline uint32_t byte_size_of_sample_set(void)
@@ -279,6 +301,16 @@ static inline void prepare_to_write_adc_clock_register(uint8_t OSR_bits, uint8_t
     prepare_to_write_adc_register(0x03, clock_reg);
 }
 
+static inline void prepare_to_write_adc_gain1_register(uint8_t g0, uint8_t g1,
+                                                       uint8_t g2, uint8_t g3)
+// Set the oversampling ratio and power bits by writing to the CLOCK register (0x01).
+{
+    // All channels enabled (bits 11:8); TBM (bit 5, turbo mode) clear.
+    uint16_t gain1_reg = ((uint16_t)g3 << 12) | ((uint16_t)g2 << 8) |
+        ((uint16_t)g1 << 4) | (uint16_t)g0;
+    prepare_to_write_adc_register(0x04, gain1_reg);
+}
+
 static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
 // Returns 0 on a successful transfer, 1 on time-out.
 {
@@ -293,9 +325,7 @@ static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
     //
     // 2026-10-22 PJ For the moment, get the DMA module to do the data transfers
     // but keep all of the code here so that it is just a simple replacement for the
-    // original blocking call above.  Eventually, we will make better use of all of
-    // this machinery by starting off exchanges with all 4 ADS131M04 chips letting
-    // them independently complete.
+    // original blocking call above.
     uint64_t timeout = time_us_64() + timeout_period_us;
     // Configure DMA channels to start later.
     uint32_t start_mask = 0;
@@ -394,6 +424,11 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint16_t trigger_level = (uint16_t) vregister[TRIG_LEVEL];
     uint8_t trigger_slope = (uint8_t)vregister[TRIG_SLOPE];
     //
+    uint8_t g0 = (uint8_t)vregister[GAIN_AIN0];
+    uint8_t g1 = (uint8_t)vregister[GAIN_AIN1];
+    uint8_t g2 = (uint8_t)vregister[GAIN_AIN2];
+    uint8_t g3 = (uint8_t)vregister[GAIN_AIN3];
+    //
     last_sampling_error = 0;
     next_fullword_index_in_data = 0; // Start afresh, at index 0.
     fullword_index_has_wrapped_around = 0;
@@ -424,19 +459,26 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // Set the OSR and PWR in the CLOCK register before the first SYNC.
     prepare_to_write_adc_clock_register(OSR_bits, PWR_bits);
     // We actually set the register by exchanging a full frame.
-    // With the SPI clock running at 8MHz, we expect 1 byte transferred per microsecond.
+    // With the SPI clock running at 4MHz, we expect 1 byte transferred per 2 microseconds.
     // Set a reasonable time-out period to give sufficient time for 18 bytes to be exchanged.
-    // FIX-ME PJ 2026-10-22 We should check the return value from this call.
-    exchange_full_frame_adc0123(100);
+    if (exchange_full_frame_adc0123(100)) return 101;
     // Read the response.
     prepare_adc_command(0); // NULL command
-    timeout = time_us_64() + 10000; // 10ms timeout
-    if (wait_for_data_ready_adc0(timeout)) return 4;
     busy_wait_us(1);
-    exchange_full_frame_adc0123(100);
-    // At this point, we have the response to the register-write command
-    // sitting in the incoming buffer.
-    // FIX-ME PJ 2026-10-21 we should check that the register was written.
+    if (exchange_full_frame_adc0123(100)) return 102;
+    // At this point, we have the response to the clock register-write command
+    // sitting in the incoming buffers.
+    // FIX-ME PJ 2026-10-21 Maybe we should check that the register was written
+    // but we have observed it via the logic analyser and if seems ok.
+    //
+    prepare_to_write_adc_gain1_register(g0, g1, g2, g3);
+    busy_wait_us(1);
+    if (exchange_full_frame_adc0123(100)) return 103;
+    prepare_adc_command(0); // NULL command
+    busy_wait_us(1);
+    if (exchange_full_frame_adc0123(100)) return 104;
+    // At this point, we have the response to the gain1 register-write command
+    // sitting in the incoming buffers.
     //
     // Assert the SYNCHn pin to synchronise the ADS131M04
     // and activate sampling with the new clock-register setting.
@@ -448,21 +490,29 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // for OSR >= 128, 3 sample periods appears to be adequate.
     // We read 3 frames and ignore the data to clear the pipeline.
     for (int i = 0; i < 3; i++) {
-        timeout = time_us_64() + sample_period_us + 1000;
-        if (wait_for_data_ready_adc0(timeout)) return (1 + i);
+        // Allow plenty of time for ADC start-up.
+        timeout = time_us_64() + sample_period_us + 10000;
+        if (wait_for_data_ready_adc0(timeout)) return (201 + i);
         busy_wait_us(1);
-        exchange_full_frame_adc0123(100);
+        if (exchange_full_frame_adc0123(100)) return 105;
     }
     //
+    did_not_keep_up_during_sampling = 0; // Presume that we will be fast enough.
+    //
     while (samples_remaining > 0) {
+        // The sample period is regulated by the ADS131M04 clock frequency and OSR
+        // so we have to wait for the DRDY signal.
+        timeout = time_us_64() + sample_period_us;
         sampling_LED_ON();
+        if (wait_for_data_ready_adc0(timeout)) return 9;
         //
         // Take the analog sample set.
-        // Keep timeout tight to avoid FIFO issues (max 2 samples in FIFO)
-        timeout = time_us_64() + sample_period_us + 1000;
-        if (wait_for_data_ready_adc0(timeout)) return 9;
+        //
+        // We need to check the sample processing time to be sure that
+        // we are not exceeding the sample_period and thus missing samples.
+        timeout = time_us_64() + sample_period_us;
         busy_wait_us(1);
-        exchange_full_frame_adc0123(100);
+        if (exchange_full_frame_adc0123(100)) return 301;
         unpack_adc_sample_data();
         for (uint ch=0; ch < n_analog_channels; ++ch) {
             data[next_fullword_index_in_data+ch] = sample_data[ch];
@@ -501,6 +551,8 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
             fullword_index_has_wrapped_around = 1;
         }
         sampling_LED_OFF();
+        // If we arrive late, even for one sample set, set the global flag.
+        if (time_reached(timeout)) did_not_keep_up_during_sampling = 1;
     } // end while (main sampling loop)
     //
     pwm_set_enabled(slice_num, false);
@@ -792,8 +844,10 @@ void interpret_command(char* cmdStr)
         assert_ready();
         break;
     case 'k':
-        // Report the value of the last_sampling_error and last_exchange_error codes.
-        printf("%d %d %u ok\n", last_sampling_error, last_exchange_error,
+        // Report the value of the late-flag, last_sampling_error
+        // and last_exchange_error codes.
+        printf("%d %d %d %u ok\n", did_not_keep_up_during_sampling,
+               last_sampling_error, last_exchange_error,
                dma_did_not_finish_mask);
         break;
     case 'I':
