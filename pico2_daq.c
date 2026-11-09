@@ -140,9 +140,9 @@ const uint8_t OSR_1024 = 3;
 const uint8_t OSR_2048 = 4;
 const uint8_t OSR_4096 = 5;
 const uint8_t OSR_8192 = 6;
-const uint8_t OSR_16256 = 7;
+const uint8_t OSR_16384 = 7;
 
-static const uint32_t OSR_value[8] = {128, 256, 512, 1024, 2048, 4096, 8192, 16256};
+static const uint32_t OSR_value[8] = {128, 256, 512, 1024, 2048, 4096, 8192, 16384};
 
 // Options for Power bits in CLOCK register.
 const uint8_t VERY_LOW_POWER = 0;
