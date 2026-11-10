@@ -33,16 +33,7 @@
 #include "pin_names.h"
 #include "crc16.h"
 
-#define VERSION_STR "v0.13 Pico2 as DAQ-MCU 2026-11-10"
-
-// Nominally, we have 4 SPI ports or SPI-like ports,
-// each talking to individual ADC chip.
-//   spi0 is a true SPI port
-//   spi1 is a true SPI port
-//   spi2 is a pio0-implemented SPI port
-//   spi3 is a pio1-implemented SPI port
-const uint n_adc_chips = 4;
-
+#define VERSION_STR "v0.14 Pico2 as DAQ-MCU 2026-11-10"
 
 static inline void assert_ready()
 {
@@ -96,32 +87,35 @@ int32_t data[N_FULLWORDS];
 uint32_t next_fullword_index_in_data;
 uint8_t fullword_index_has_wrapped_around;
 
+// Nominally, we have 4 SPI ports or SPI-like ports,
+// each talking to individual ADC chip.
+//   spi0 is a true SPI port
+//   spi1 is a true SPI port
+//   spi2 is a pio0-implemented SPI port
+//   spi3 is a pio1-implemented SPI port
+#define N_SPI_PORTS 4
+
 // We are going to communicate with the ADS131M04 with its default word size
 // of 24 bits and a full frames of 6 words but we will look at this data as
 // 18 bytes when interacting with the Pico2's SPI modules.
 # define N_BYTES_IN_FRAME 18
 typedef struct { uint8_t bytes[N_BYTES_IN_FRAME]; } BBuffer;
-// All 4 ADC chips receive the same messages but
-// we receive the incoming messages in separate buffers.
-static BBuffer outgoing_frame_adc;
-static BBuffer incoming_frame_adc[4];
+// Transmit outgoing messages from and receive the incoming messages
+// into separate buffers.
+static BBuffer outgoing_frame_adc[N_SPI_PORTS];
+static BBuffer incoming_frame_adc[N_SPI_PORTS];
 
 // The data will be sent to (and received from) the SPI ports via DMA.
 // We use a DMA channel for each transmit and receive transaction.
-// channel-index  SPI port
-// 0              spi0_tx (true SPI module)
-// 1              spi0_rx
-// 2              spi1_tx (true SPI module)
-// 3              spi1_rx
-// 4              spi2_tx (PIO implemented SPI)
-// 5              spi2_rx
-// 6              spi3_tx (PIO implemented SPI)
-// 7              spi3_rx
-#define N_DMA_CHANNELS 8
-static uint dma_channel[N_DMA_CHANNELS];
-static dma_channel_config dma_cfg[N_DMA_CHANNELS];
-static io_rw_8 *dma_write_addr[N_DMA_CHANNELS];
-static io_rw_8 *dma_read_addr[N_DMA_CHANNELS];
+static uint dma_channel_tx[N_SPI_PORTS];
+static uint dma_channel_rx[N_SPI_PORTS];
+static dma_channel_config dma_cfg_tx[N_SPI_PORTS];
+static dma_channel_config dma_cfg_rx[N_SPI_PORTS];
+static io_rw_8 *dma_write_addr_tx[N_SPI_PORTS];
+static io_rw_8 *dma_write_addr_rx[N_SPI_PORTS];
+static io_rw_8 *dma_read_addr_tx[N_SPI_PORTS];
+static io_rw_8 *dma_read_addr_rx[N_SPI_PORTS];
+static uint cs_pin[N_SPI_PORTS];
 
 static int last_exchange_error;
 #define EX_ERR_NONE 0
@@ -255,20 +249,21 @@ static inline int wait_for_data_ready_adc0(uint64_t timeout)
     return 0;
 }
 
-static inline void prepare_adc_command(uint16_t cmd)
+static inline void prepare_adc_command(uint8_t iadc, uint16_t cmd)
 // Set up outgoing buffer data for a simple command at next full-frame exchange.
 // Assume that we are working with the default 24-bit word size of the ADS131M04
 // and that we have not enabled the CRC.
 {
-    outgoing_frame_adc.bytes[0] = (uint8_t)((cmd & 0xff00) >> 8);
-    outgoing_frame_adc.bytes[1] = (uint8_t)(cmd & 0x00ff);
-    outgoing_frame_adc.bytes[2] = 0; // zero-pad the 24-bit word
+    outgoing_frame_adc[iadc].bytes[0] = (uint8_t)((cmd & 0xff00) >> 8);
+    outgoing_frame_adc[iadc].bytes[1] = (uint8_t)(cmd & 0x00ff);
+    outgoing_frame_adc[iadc].bytes[2] = 0; // zero-pad the 24-bit word
     for (uint i = 3; i < N_BYTES_IN_FRAME; ++i) {
-        outgoing_frame_adc.bytes[i] = (uint8_t)0;
+        outgoing_frame_adc[iadc].bytes[i] = (uint8_t)0;
     }
 }
 
-static inline void prepare_to_write_adc_register(uint8_t reg_addr, uint16_t reg_value)
+static inline void prepare_to_write_adc_register(uint8_t j,
+                                                 uint8_t reg_addr, uint16_t reg_value)
 // Set up outgoing buffer data to write a 16-bit value to an ADS131M04 register
 // at the next full-frame exchange.
 //
@@ -281,34 +276,37 @@ static inline void prepare_to_write_adc_register(uint8_t reg_addr, uint16_t reg_
 // For a single register write, n=0.
 {
     uint16_t cmd = 0x6000 | ((reg_addr & 0x3f) << 7); // WREG command with address
-    outgoing_frame_adc.bytes[0] = (uint8_t)((cmd & 0xff00) >> 8);
-    outgoing_frame_adc.bytes[1] = (uint8_t)(cmd & 0x00ff);
-    outgoing_frame_adc.bytes[2] = 0; // zero-pad the 24-bit word
+    outgoing_frame_adc[j].bytes[0] = (uint8_t)((cmd & 0xff00) >> 8);
+    outgoing_frame_adc[j].bytes[1] = (uint8_t)(cmd & 0x00ff);
+    outgoing_frame_adc[j].bytes[2] = 0; // zero-pad the 24-bit word
     // Second word contains the 16-bit value to be written into the register.
-    outgoing_frame_adc.bytes[3] = (uint8_t)((reg_value & 0xff00) >> 8);
-    outgoing_frame_adc.bytes[4] = (uint8_t)(reg_value & 0x00ff);
-    outgoing_frame_adc.bytes[5] = 0; // zero-pad the 24-bit word
+    outgoing_frame_adc[j].bytes[3] = (uint8_t)((reg_value & 0xff00) >> 8);
+    outgoing_frame_adc[j].bytes[4] = (uint8_t)(reg_value & 0x00ff);
+    outgoing_frame_adc[j].bytes[5] = 0; // zero-pad the 24-bit word
     for (uint i = 6; i < N_BYTES_IN_FRAME; ++i) {
-        outgoing_frame_adc.bytes[i] = (uint8_t)0;
+        outgoing_frame_adc[j].bytes[i] = (uint8_t)0;
     }
 }
 
-static inline void prepare_to_write_adc_clock_register(uint8_t OSR_bits, uint8_t PWR_bits)
+static inline void prepare_to_write_adc_clock_register(uint8_t iadc,
+                                                       uint8_t OSR_bits,
+                                                       uint8_t PWR_bits)
 // Set the oversampling ratio and power bits by writing to the CLOCK register (0x01).
 {
     // All channels enabled (bits 11:8); TBM (bit 5, turbo mode) clear.
     uint16_t clock_reg = 0x0f00 | (OSR_bits << 2) | PWR_bits;
-    prepare_to_write_adc_register(0x03, clock_reg);
+    prepare_to_write_adc_register(iadc, 0x03, clock_reg);
 }
 
-static inline void prepare_to_write_adc_gain1_register(uint8_t g0, uint8_t g1,
+static inline void prepare_to_write_adc_gain1_register(uint8_t iadc,
+                                                       uint8_t g0, uint8_t g1,
                                                        uint8_t g2, uint8_t g3)
 // Set the oversampling ratio and power bits by writing to the CLOCK register (0x01).
 {
     // All channels enabled (bits 11:8); TBM (bit 5, turbo mode) clear.
     uint16_t gain1_reg = ((uint16_t)g3 << 12) | ((uint16_t)g2 << 8) |
         ((uint16_t)g1 << 4) | (uint16_t)g0;
-    prepare_to_write_adc_register(0x04, gain1_reg);
+    prepare_to_write_adc_register(iadc, 0x04, gain1_reg);
 }
 
 static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
@@ -316,10 +314,7 @@ static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
 {
     last_exchange_error = EX_ERR_NONE; // Clear it out.
     // Select the ADS131M04 chips.
-    gpio_put(CS_0_PIN, 0);
-    gpio_put(CS_1_PIN, 0);
-    gpio_put(CS_2_PIN, 0);
-    gpio_put(CS_3_PIN, 0);
+    for (uint i=0; i < N_SPI_PORTS; i++) { gpio_put(cs_pin[i], 0); }
     busy_wait_us(1);
     // spi_write_read_blocking(spi0, outgoing_bytes_adc, incoming_bytes_adc, N_BYTES_IN_FRAME);
     //
@@ -329,54 +324,59 @@ static inline int exchange_full_frame_adc0123(uint32_t timeout_period_us)
     uint64_t timeout = time_us_64() + timeout_period_us;
     // Configure DMA channels to start later.
     uint32_t start_mask = 0;
-    for (uint i=0; i < N_DMA_CHANNELS; i++) {
-        dma_channel_configure(dma_channel[i], &dma_cfg[i], dma_write_addr[i], dma_read_addr[i],
+    for (uint i=0; i < N_SPI_PORTS; i++) {
+        dma_channel_configure(dma_channel_tx[i], &dma_cfg_tx[i],
+                              dma_write_addr_tx[i], dma_read_addr_tx[i],
                               dma_encode_transfer_count(N_BYTES_IN_FRAME), false);
-        start_mask |= 1u << dma_channel[i];
+        start_mask |= 1u << dma_channel_tx[i];
+        dma_channel_configure(dma_channel_rx[i], &dma_cfg_rx[i],
+                              dma_write_addr_rx[i], dma_read_addr_rx[i],
+                              dma_encode_transfer_count(N_BYTES_IN_FRAME), false);
+        start_mask |= 1u << dma_channel_rx[i];
     }
     // At this point, the outgoing data bytes are in place and ready to be sent via SPI.
     dma_start_channel_mask(start_mask);
     //
     // Wait for the data to be clocked out.
     bool dma_is_busy = false;
-    for (uint i=0; i < N_DMA_CHANNELS; i++) {
-        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_channel[i]);
+    for (uint i=0; i < N_SPI_PORTS; i++) {
+        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_channel_tx[i]);
+        dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_channel_rx[i]);
     }
     while (dma_is_busy) {
         if (time_reached(timeout)) {
             // Deselect the ADS131M04-x chips and get out, signalling time-out.
-            gpio_put(CS_0_PIN, 1);
-            gpio_put(CS_1_PIN, 1);
-            gpio_put(CS_2_PIN, 1);
-            gpio_put(CS_3_PIN, 1);
+            for (uint i=0; i < N_SPI_PORTS; i++) { gpio_put(cs_pin[i], 1); }
             last_exchange_error = EX_ERR_DMA_DID_NOT_FINISH;
             dma_did_not_finish_mask = 0;
-            for (uint i=0; i < N_DMA_CHANNELS; i++) {
-                if (dma_channel_is_busy(dma_channel[i])) {
-                    dma_did_not_finish_mask |= 1u << i;
-                    dma_channel_abort(dma_channel[i]);
+            for (uint i=0; i < N_SPI_PORTS; i++) {
+                if (dma_channel_is_busy(dma_channel_tx[i])) {
+                    dma_did_not_finish_mask |= 1u << (2*i);
+                    dma_channel_abort(dma_channel_tx[i]);
+                }
+                if (dma_channel_is_busy(dma_channel_rx[i])) {
+                    dma_did_not_finish_mask |= 1u << (2*i+1);
+                    dma_channel_abort(dma_channel_rx[i]);
                 }
             }
             return 1;
         }
         busy_wait_us(10);
         dma_is_busy = false;
-        for (uint i=0; i < N_DMA_CHANNELS; i++) {
-            dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_channel[i]);
+        for (uint i=0; i < N_SPI_PORTS; i++) {
+            dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_channel_tx[i]);
+            dma_is_busy = dma_is_busy || dma_channel_is_busy(dma_channel_rx[i]);
         }
     }
     // Normal completion, within time-out period.
     // Deselect the ADS131M04-x chips before leaving.
-    gpio_put(CS_0_PIN, 1);
-    gpio_put(CS_1_PIN, 1);
-    gpio_put(CS_2_PIN, 1);
-    gpio_put(CS_3_PIN, 1);
+    for (uint i=0; i < N_SPI_PORTS; i++) { gpio_put(cs_pin[i], 1); }
     return 0;
 }
 
 static inline void unpack_adc_sample_data()
 {
-    for (int iadc=0; iadc < n_adc_chips; ++iadc) {
+    for (int iadc=0; iadc < N_SPI_PORTS; ++iadc) {
         for (int ch=0; ch < 4; ++ch) {
             int32_t word = 0L;
             uint ib = (1+ch)*3; // index of the high-byte for channel ch.
@@ -457,13 +457,17 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     if (assert_adc_synch(reset_duration_us, timeout)) return 98;
     //
     // Set the OSR and PWR in the CLOCK register before the first SYNC.
-    prepare_to_write_adc_clock_register(OSR_bits, PWR_bits);
+    for (uint i=0; i < N_SPI_PORTS; i++) {
+        prepare_to_write_adc_clock_register(i, OSR_bits, PWR_bits);
+    }
     // We actually set the register by exchanging a full frame.
     // With the SPI clock running at 4MHz, we expect 1 byte transferred per 2 microseconds.
     // Set a reasonable time-out period to give sufficient time for 18 bytes to be exchanged.
     if (exchange_full_frame_adc0123(100)) return 101;
     // Read the response.
-    prepare_adc_command(0); // NULL command
+    for (uint i=0; i < N_SPI_PORTS; i++) {
+        prepare_adc_command(i, 0); // NULL command
+    }
     busy_wait_us(1);
     if (exchange_full_frame_adc0123(100)) return 102;
     // At this point, we have the response to the clock register-write command
@@ -471,10 +475,14 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // FIX-ME PJ 2026-10-21 Maybe we should check that the register was written
     // but we have observed it via the logic analyser and if seems ok.
     //
-    prepare_to_write_adc_gain1_register(g0, g1, g2, g3);
+    for (uint i=0; i < N_SPI_PORTS; i++) {
+        prepare_to_write_adc_gain1_register(i, g0, g1, g2, g3);
+    }
     busy_wait_us(1);
     if (exchange_full_frame_adc0123(100)) return 103;
-    prepare_adc_command(0); // NULL command
+    for (uint i=0; i < N_SPI_PORTS; i++) {
+        prepare_adc_command(i, 0); // NULL command
+    }
     busy_wait_us(1);
     if (exchange_full_frame_adc0123(100)) return 104;
     // At this point, we have the response to the gain1 register-write command
@@ -949,23 +957,23 @@ int main()
     // Transfer bytes to and from each of the ADC chips via a pair of DMA channels.
     // Start with a generic config for each TX and RX channel.
     //
-    for (uint i=0; i < n_adc_chips; i++) {
-        uint itx = i*2;
-        dma_channel[itx] = dma_claim_unused_channel(true);
-        dma_cfg[itx] = dma_channel_get_default_config(dma_channel[itx]);
-        channel_config_set_transfer_data_size(&dma_cfg[itx], DMA_SIZE_8);
-        channel_config_set_read_increment(&dma_cfg[itx], true);
-        channel_config_set_write_increment(&dma_cfg[itx], false);
-        uint irx = itx+1;
-        dma_channel[irx] = dma_claim_unused_channel(true);
-        dma_cfg[irx] = dma_channel_get_default_config(dma_channel[irx]);
-        channel_config_set_transfer_data_size(&dma_cfg[irx], DMA_SIZE_8);
-        channel_config_set_read_increment(&dma_cfg[irx], false);
-        channel_config_set_write_increment(&dma_cfg[irx], true);
+    for (uint i=0; i < N_SPI_PORTS; i++) {
+        dma_channel_tx[i] = dma_claim_unused_channel(true);
+        dma_cfg_tx[i] = dma_channel_get_default_config(dma_channel_tx[i]);
+        channel_config_set_transfer_data_size(&dma_cfg_tx[i], DMA_SIZE_8);
+        channel_config_set_read_increment(&dma_cfg_tx[i], true);
+        channel_config_set_write_increment(&dma_cfg_tx[i], false);
+        //
+        dma_channel_rx[i] = dma_claim_unused_channel(true);
+        dma_cfg_rx[i] = dma_channel_get_default_config(dma_channel_rx[i]);
+        channel_config_set_transfer_data_size(&dma_cfg_rx[i], DMA_SIZE_8);
+        channel_config_set_read_increment(&dma_cfg_rx[i], false);
+        channel_config_set_write_increment(&dma_cfg_rx[i], true);
     }
 	//
 	// Configure pins to drive the ADS131M04-0 chip with SPI0.
 	//
+    cs_pin[0] = CS_0_PIN;
     gpio_init(CS_0_PIN);
     gpio_set_dir(CS_0_PIN, GPIO_OUT);
     gpio_set_slew_rate(CS_0_PIN, GPIO_SLEW_RATE_FAST);
@@ -983,16 +991,17 @@ int main()
     gpio_set_dir(DRDY_0_PIN, GPIO_IN);
     //
     // The dma-transfer requests are paced by the SPI peripheral.
-    channel_config_set_dreq(&dma_cfg[0], spi_get_dreq(spi0, true)); // tx
-    channel_config_set_dreq(&dma_cfg[1], spi_get_dreq(spi0, false)); // rx
+    channel_config_set_dreq(&dma_cfg_tx[0], spi_get_dreq(spi0, true)); // tx
+    channel_config_set_dreq(&dma_cfg_rx[0], spi_get_dreq(spi0, false)); // rx
     // Write and read addresses for the channels.
-    dma_write_addr[0] = (io_rw_8*)&spi_get_hw(spi0)->dr;
-    dma_read_addr[0] = outgoing_frame_adc.bytes;
-    dma_write_addr[1] = incoming_frame_adc[0].bytes;
-    dma_read_addr[1] = (io_rw_8*)&spi_get_hw(spi0)->dr;
+    dma_write_addr_tx[0] = (io_rw_8*)&spi_get_hw(spi0)->dr;
+    dma_read_addr_tx[0] = outgoing_frame_adc[0].bytes;
+    dma_write_addr_rx[0] = incoming_frame_adc[0].bytes;
+    dma_read_addr_rx[0] = (io_rw_8*)&spi_get_hw(spi0)->dr;
 	//
 	// Configure pins to drive the ADS131M04-1 chip with SPI1.
 	//
+    cs_pin[1] = CS_1_PIN;
     gpio_init(CS_1_PIN);
     gpio_set_dir(CS_1_PIN, GPIO_OUT);
     gpio_set_slew_rate(CS_1_PIN, GPIO_SLEW_RATE_FAST);
@@ -1011,13 +1020,13 @@ int main()
     gpio_set_dir(DRDY_1_PIN, GPIO_IN);
     //
     // The dma-transfer requests are paced by the SPI peripheral.
-    channel_config_set_dreq(&dma_cfg[2], spi_get_dreq(spi1, true)); // tx
-    channel_config_set_dreq(&dma_cfg[3], spi_get_dreq(spi1, false)); // rx
+    channel_config_set_dreq(&dma_cfg_tx[1], spi_get_dreq(spi1, true)); // tx
+    channel_config_set_dreq(&dma_cfg_rx[1], spi_get_dreq(spi1, false)); // rx
     // Write and read addresses for the channels.
-    dma_write_addr[2] = (io_rw_8*)&spi_get_hw(spi1)->dr;
-    dma_read_addr[2] = outgoing_frame_adc.bytes;
-    dma_write_addr[3] = incoming_frame_adc[1].bytes;
-    dma_read_addr[3] = (io_rw_8*)&spi_get_hw(spi1)->dr;
+    dma_write_addr_tx[1] = (io_rw_8*)&spi_get_hw(spi1)->dr;
+    dma_read_addr_tx[1] = outgoing_frame_adc[1].bytes;
+    dma_write_addr_rx[1] = incoming_frame_adc[1].bytes;
+    dma_read_addr_rx[1] = (io_rw_8*)&spi_get_hw(spi1)->dr;
     //
     // We implement spi2 and spi3 with state machines in the PIO 0 and 1 modules.
     uint offset0 = pio_add_program(pio0, &spi_cpol0_cpha1_program);
@@ -1025,6 +1034,7 @@ int main()
     //
     // Configure pins to drive the ADS131M04-2 chip via pio0 sm=0 implementing spi2
     //
+    cs_pin[2] = CS_2_PIN;
     gpio_init(CS_2_PIN);
     gpio_set_dir(CS_2_PIN, GPIO_OUT);
     gpio_set_slew_rate(CS_2_PIN, GPIO_SLEW_RATE_FAST);
@@ -1036,16 +1046,17 @@ int main()
     gpio_set_dir(DRDY_2_PIN, GPIO_IN);
     //
     // The dma-transfer requests are paced by the PIO peripheral.
-    channel_config_set_dreq(&dma_cfg[4], pio_get_dreq(pio0, 0, true)); // tx
-    channel_config_set_dreq(&dma_cfg[5], pio_get_dreq(pio0, 0, false)); // rx
+    channel_config_set_dreq(&dma_cfg_tx[2], pio_get_dreq(pio0, 0, true)); // tx
+    channel_config_set_dreq(&dma_cfg_rx[2], pio_get_dreq(pio0, 0, false)); // rx
     // Write and read addresses for the channels.
-    dma_write_addr[4] = (io_rw_8*)&pio0->txf[0];
-    dma_read_addr[4] = outgoing_frame_adc.bytes;
-    dma_write_addr[5] = incoming_frame_adc[2].bytes;
-    dma_read_addr[5] = (io_rw_8*)&pio0->rxf[0];
+    dma_write_addr_tx[2] = (io_rw_8*)&pio0->txf[0];
+    dma_read_addr_tx[2] = outgoing_frame_adc[2].bytes;
+    dma_write_addr_rx[2] = incoming_frame_adc[2].bytes;
+    dma_read_addr_rx[2] = (io_rw_8*)&pio0->rxf[0];
     //
     // Configure pins to drive the ADS131M04-3 chip via pio1 sm=0 implementing spi3
     //
+    cs_pin[3] = CS_3_PIN;
     gpio_init(CS_3_PIN);
     gpio_set_dir(CS_3_PIN, GPIO_OUT);
     gpio_set_slew_rate(CS_3_PIN, GPIO_SLEW_RATE_FAST);
@@ -1057,13 +1068,13 @@ int main()
     gpio_set_dir(DRDY_3_PIN, GPIO_IN);
     //
     // The dma-transfer requests are paced by the PIO peripheral.
-    channel_config_set_dreq(&dma_cfg[6], pio_get_dreq(pio1, 0, true)); // tx
-    channel_config_set_dreq(&dma_cfg[7], pio_get_dreq(pio1, 0, false)); // rx
+    channel_config_set_dreq(&dma_cfg_tx[3], pio_get_dreq(pio1, 0, true)); // tx
+    channel_config_set_dreq(&dma_cfg_rx[3], pio_get_dreq(pio1, 0, false)); // rx
     // Write and read addresses for the channels.
-    dma_write_addr[6] = (io_rw_8*)&pio1->txf[0];
-    dma_read_addr[6] = outgoing_frame_adc.bytes;
-    dma_write_addr[7] = incoming_frame_adc[3].bytes;
-    dma_read_addr[7] = (io_rw_8*)&pio1->rxf[0];
+    dma_write_addr_tx[3] = (io_rw_8*)&pio1->txf[0];
+    dma_read_addr_tx[3] = outgoing_frame_adc[3].bytes;
+    dma_write_addr_rx[3] = incoming_frame_adc[3].bytes;
+    dma_read_addr_rx[3] = (io_rw_8*)&pio1->rxf[0];
     //
     // Configure SYNC pin for manual interaction.
     //
@@ -1109,10 +1120,14 @@ int main()
     //
     spi_deinit(spi0);
     spi_deinit(spi1);
+    pio_sm_set_enabled(pio0, 0, false);
+    pio_sm_set_enabled(pio1, 0, false);
     //
-    for (uint i=0; i < N_DMA_CHANNELS; i++) {
-        dma_channel_cleanup(dma_channel[i]);
-        dma_channel_unclaim(dma_channel[i]);
+    for (uint i=0; i < N_SPI_PORTS; i++) {
+        dma_channel_cleanup(dma_channel_tx[i]);
+        dma_channel_unclaim(dma_channel_tx[i]);
+        dma_channel_cleanup(dma_channel_rx[i]);
+        dma_channel_unclaim(dma_channel_rx[i]);
     }
     return 0;
 }
