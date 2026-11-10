@@ -33,7 +33,7 @@
 #include "pin_names.h"
 #include "crc16.h"
 
-#define VERSION_STR "v0.14 Pico2 as DAQ-MCU 2026-11-10"
+#define VERSION_STR "v0.15 Pico2 as DAQ-MCU 2026-11-10"
 
 static inline void assert_ready()
 {
@@ -164,7 +164,7 @@ const uint8_t SLOPE_NEG = 0;
 const uint8_t SLOPE_POS = 1;
 
 // Parameters controlling the device are stored in virtual config registers.
-#define NUMREG 13
+#define NUMREG 25
 int32_t vregister[NUMREG];
 const uint MCLK_KHZ = 0;
 const uint OSR_SELECT = 1;
@@ -175,10 +175,23 @@ const uint TRIG_MODE = 5;
 const uint TRIG_CHAN = 6;
 const uint TRIG_LEVEL = 7;
 const uint TRIG_SLOPE = 8;
-const uint GAIN_AIN0 = 9;
-const uint GAIN_AIN1 = 10;
-const uint GAIN_AIN2 = 11;
-const uint GAIN_AIN3 = 12;
+// The following names are close to the labels of the connectors on the PCB.
+const uint GAIN_AIN0_0 = 9;
+const uint GAIN_AIN1_0 = 10;
+const uint GAIN_AIN2_0 = 11;
+const uint GAIN_AIN3_0 = 12;
+const uint GAIN_AIN0_1 = 13;
+const uint GAIN_AIN1_1 = 14;
+const uint GAIN_AIN2_1 = 15;
+const uint GAIN_AIN3_1 = 16;
+const uint GAIN_AIN0_2 = 17;
+const uint GAIN_AIN1_2 = 18;
+const uint GAIN_AIN2_2 = 19;
+const uint GAIN_AIN3_2 = 20;
+const uint GAIN_AIN0_3 = 21;
+const uint GAIN_AIN1_3 = 22;
+const uint GAIN_AIN2_3 = 23;
+const uint GAIN_AIN3_3 = 24;
 
 void set_registers_to_original_values()
 {
@@ -196,11 +209,22 @@ void set_registers_to_original_values()
     vregister[TRIG_CHAN] = 0; // trigger channel for internal trigger
     vregister[TRIG_LEVEL] = 10000; // trigger level as a signed integer
     vregister[TRIG_SLOPE] = SLOPE_POS;
-    // All ADC chips use receive the same set of PGA selections.
-    vregister[GAIN_AIN0] = PGAGAIN_1;
-    vregister[GAIN_AIN1] = PGAGAIN_1;
-    vregister[GAIN_AIN2] = PGAGAIN_1;
-    vregister[GAIN_AIN3] = PGAGAIN_1;
+    vregister[GAIN_AIN0_0] = PGAGAIN_1;
+    vregister[GAIN_AIN1_0] = PGAGAIN_1;
+    vregister[GAIN_AIN2_0] = PGAGAIN_1;
+    vregister[GAIN_AIN3_0] = PGAGAIN_1;
+    vregister[GAIN_AIN0_1] = PGAGAIN_1;
+    vregister[GAIN_AIN1_1] = PGAGAIN_1;
+    vregister[GAIN_AIN2_1] = PGAGAIN_1;
+    vregister[GAIN_AIN3_1] = PGAGAIN_1;
+    vregister[GAIN_AIN0_2] = PGAGAIN_1;
+    vregister[GAIN_AIN1_2] = PGAGAIN_1;
+    vregister[GAIN_AIN2_2] = PGAGAIN_1;
+    vregister[GAIN_AIN3_2] = PGAGAIN_1;
+    vregister[GAIN_AIN0_3] = PGAGAIN_1;
+    vregister[GAIN_AIN1_3] = PGAGAIN_1;
+    vregister[GAIN_AIN2_3] = PGAGAIN_1;
+    vregister[GAIN_AIN3_3] = PGAGAIN_1;
 }
 
 static inline uint32_t byte_size_of_sample_set(void)
@@ -424,11 +448,6 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint16_t trigger_level = (uint16_t) vregister[TRIG_LEVEL];
     uint8_t trigger_slope = (uint8_t)vregister[TRIG_SLOPE];
     //
-    uint8_t g0 = (uint8_t)vregister[GAIN_AIN0];
-    uint8_t g1 = (uint8_t)vregister[GAIN_AIN1];
-    uint8_t g2 = (uint8_t)vregister[GAIN_AIN2];
-    uint8_t g3 = (uint8_t)vregister[GAIN_AIN3];
-    //
     last_sampling_error = 0;
     next_fullword_index_in_data = 0; // Start afresh, at index 0.
     fullword_index_has_wrapped_around = 0;
@@ -476,6 +495,18 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // but we have observed it via the logic analyser and if seems ok.
     //
     for (uint i=0; i < N_SPI_PORTS; i++) {
+        uint vreg0;
+        switch (i) {
+        case 0: vreg0 = GAIN_AIN0_0; break;
+        case 1: vreg0 = GAIN_AIN0_1; break;
+        case 2: vreg0 = GAIN_AIN0_2; break;
+        case 3: vreg0 = GAIN_AIN0_3; break;
+        default: vreg0 = GAIN_AIN0_0;
+        }
+        uint8_t g0 = (uint8_t)vregister[vreg0];
+        uint8_t g1 = (uint8_t)vregister[vreg0+1];
+        uint8_t g2 = (uint8_t)vregister[vreg0+2];
+        uint8_t g3 = (uint8_t)vregister[vreg0+3];
         prepare_to_write_adc_gain1_register(i, g0, g1, g2, g3);
     }
     busy_wait_us(1);
