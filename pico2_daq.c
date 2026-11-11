@@ -33,7 +33,7 @@
 #include "pin_names.h"
 #include "crc16.h"
 
-#define VERSION_STR "v0.15 Pico2 as DAQ-MCU 2026-11-10"
+#define VERSION_STR "v0.16 Pico2 as DAQ-MCU 2026-11-11"
 
 static inline void assert_ready()
 {
@@ -146,14 +146,14 @@ const uint8_t LOW_POWER = 1;
 const uint8_t HIGH_RESOLUTION = 2;
 
 // Options for the GAIN1 register.
-const uint8_t PGAGAIN_1 = 0;
-const uint8_t PGAGAIN_2 = 1;
-const uint8_t PGAGAIN_4 = 2;
-const uint8_t PGAGAIN_8 = 3;
-const uint8_t PGAGAIN_16 = 4;
-const uint8_t PGAGAIN_32 = 5;
-const uint8_t PGAGAIN_64 = 6;
-const uint8_t PGAGAIN_128 = 7;
+const uint8_t X1 = 0;
+const uint8_t X2 = 1;
+const uint8_t X4 = 2;
+const uint8_t X8 = 3;
+const uint8_t X16 = 4;
+const uint8_t X32 = 5;
+const uint8_t X64 = 6;
+const uint8_t X128 = 7;
 
 // Options for the trigger event.
 const uint8_t TRIGGER_IMMEDIATE = 0;
@@ -209,22 +209,22 @@ void set_registers_to_original_values()
     vregister[TRIG_CHAN] = 0; // trigger channel for internal trigger
     vregister[TRIG_LEVEL] = 10000; // trigger level as a signed integer
     vregister[TRIG_SLOPE] = SLOPE_POS;
-    vregister[GAIN_AIN0_0] = PGAGAIN_1;
-    vregister[GAIN_AIN1_0] = PGAGAIN_1;
-    vregister[GAIN_AIN2_0] = PGAGAIN_1;
-    vregister[GAIN_AIN3_0] = PGAGAIN_1;
-    vregister[GAIN_AIN0_1] = PGAGAIN_1;
-    vregister[GAIN_AIN1_1] = PGAGAIN_1;
-    vregister[GAIN_AIN2_1] = PGAGAIN_1;
-    vregister[GAIN_AIN3_1] = PGAGAIN_1;
-    vregister[GAIN_AIN0_2] = PGAGAIN_1;
-    vregister[GAIN_AIN1_2] = PGAGAIN_1;
-    vregister[GAIN_AIN2_2] = PGAGAIN_1;
-    vregister[GAIN_AIN3_2] = PGAGAIN_1;
-    vregister[GAIN_AIN0_3] = PGAGAIN_1;
-    vregister[GAIN_AIN1_3] = PGAGAIN_1;
-    vregister[GAIN_AIN2_3] = PGAGAIN_1;
-    vregister[GAIN_AIN3_3] = PGAGAIN_1;
+    vregister[GAIN_AIN0_0] = X1;
+    vregister[GAIN_AIN1_0] = X1;
+    vregister[GAIN_AIN2_0] = X1;
+    vregister[GAIN_AIN3_0] = X1;
+    vregister[GAIN_AIN0_1] = X1;
+    vregister[GAIN_AIN1_1] = X1;
+    vregister[GAIN_AIN2_1] = X1;
+    vregister[GAIN_AIN3_1] = X1;
+    vregister[GAIN_AIN0_2] = X1;
+    vregister[GAIN_AIN1_2] = X1;
+    vregister[GAIN_AIN2_2] = X1;
+    vregister[GAIN_AIN3_2] = X1;
+    vregister[GAIN_AIN0_3] = X1;
+    vregister[GAIN_AIN1_3] = X1;
+    vregister[GAIN_AIN2_3] = X1;
+    vregister[GAIN_AIN3_3] = X1;
 }
 
 static inline uint32_t byte_size_of_sample_set(void)
