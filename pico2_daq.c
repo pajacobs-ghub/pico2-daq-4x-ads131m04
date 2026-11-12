@@ -33,7 +33,7 @@
 #include "pin_names.h"
 #include "crc16.h"
 
-#define VERSION_STR "v0.16 Pico2 as DAQ-MCU 2026-11-11"
+#define VERSION_STR "v0.17 Pico2 as DAQ-MCU 2026-11-13"
 
 static inline void assert_ready()
 {
@@ -445,7 +445,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint8_t n_analog_channels = (uint8_t)vregister[NCHANNELS];
     uint8_t mode = (uint8_t)vregister[TRIG_MODE];
     uint8_t trigger_chan = (uint8_t)vregister[TRIG_CHAN];
-    uint16_t trigger_level = (uint16_t) vregister[TRIG_LEVEL];
+    int32_t trigger_level = vregister[TRIG_LEVEL];
     uint8_t trigger_slope = (uint8_t)vregister[TRIG_SLOPE];
     //
     last_sampling_error = 0;
@@ -771,7 +771,7 @@ void interpret_command(char* cmdStr)
     char* token_ptr;
     const char* sep_tok = ", ";
     uint8_t i;
-	int16_t v;
+	int32_t v;
     // printf("DEBUG: DAQ MCU cmdStr=\"%s\"", cmdStr);
     if (!override_led) gpio_put(LED_PIN, 1); // To indicate start of interpreter activity.
     switch (cmdStr[0]) {
