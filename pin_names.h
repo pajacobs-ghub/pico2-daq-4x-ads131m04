@@ -28,7 +28,7 @@ const uint SCK_0_PIN = 6;
 const uint MOSI_0_PIN = 7;
 const uint DRDY_0_PIN = 28;
 #else
-// However, we may connect the ADC-0 chip.
+// However, we may connect the ADC-3 chip.
 const uint MISO_0_PIN = 16;
 const uint CS_0_PIN = 17;
 const uint SCK_0_PIN = 18;
