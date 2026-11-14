@@ -651,7 +651,7 @@ const char base64_alphabet[64] = {
 
 void base64_encode(int32_t val, char b[4]) {
     // Encode the 24-bit analog value as 4 base64 characters, storing them in array b.
-    // In the output array, the most-significant bits come first. (big-endian format)
+    // In the output array, the most-significant bytes come first. (big-endian format)
     uint indx = ((uint)val & (0x3f << 18)) >> 18;
     b[0] = base64_alphabet[indx];
     indx = ((uint)val & (0x3f << 12)) >> 12;
